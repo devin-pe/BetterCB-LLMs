@@ -1,0 +1,35 @@
+# Fine-tune an LM on the ECHR dataset using Llama3.
+
+dataset_args:
+  dataset_path: ../src/pii_leakage/extern/echr
+  dataset_mode: undefended
+  sample_duplication_rate: 1
+
+trainer_args:
+  save_steps: 0                    # Disable checkpoint saving due to disk space
+  save_strategy: "no"              # Explicitly disable saving
+  num_train_epochs: 4
+  gradient_accumulation_steps: 16   # Increased to maintain effective batch size
+  per_device_train_batch_size: 1    # Reduced for gradient memory
+  per_device_eval_batch_size: 1     # Reduced eval batch size for consistency
+  gradient_checkpointing: true      # Enable gradient checkpointing to save memory
+  bf16: true                        # Use bfloat16 for memory efficiency
+  dataloader_num_workers: 0         # Disable multiprocessing to save memory
+  max_grad_norm: 1.0               # Enable gradient clipping for stability
+  remove_unused_columns: false      # Keep all columns to avoid data copying
+  optim: "adafactor"               # Memory-efficient optimizer
+  max_steps: 1000                  # Training steps
+  eval_steps: 200                  # More frequent evaluation for monitoring
+  logging_steps: 25                # More frequent logging for monitoring
+  save_total_limit: 0              # Don't save any checkpoints
+
+model_args:
+  architecture: llama3
+  pre_trained: True   # Start from a pre-trained checkpoint
+  model_ckpt: meta-llama/Meta-Llama-3-8B
+
+ner_args:
+  ner: flair
+  ner_model: flair/ner-english-ontonotes-large
+  anon_token: <MASK>
+  anonymize: False

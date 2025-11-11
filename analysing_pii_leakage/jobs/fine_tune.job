@@ -1,0 +1,72 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100          # Partition name
+#SBATCH --gres=gpu:2                  # Request 2 GPUs for distributed training
+#SBATCH --cpus-per-task=32            # More CPU cores for multi-GPU setup
+#SBATCH --job-name=fine_tune_llama3_2gpu # Job name
+#SBATCH --ntasks=1                    # Number of tasks
+#SBATCH --time=24:00:00               # Time limit hh:mm:ss
+#SBATCH --output=/home/dpereira/CB-LLMs/analysing_pii_leakage/work/fine_tune_%A.out      # Standard output (%A expands to job ID)
+
+### --- MODULE SETUP / ENVIRONMENT ---
+module purge
+module load 2023
+# conda create -n pii-leakage python=3.10
+conda activate pii-leakage
+
+# Fix NumPy/PyTorch compatibility issues
+export NUMPY_EXPERIMENTAL_ARRAY_FUNCTION=0
+export CUDA_LAUNCH_BLOCKING=1
+
+# CUDA Memory Management - gradient-optimized for 2 GPUs (PyTorch 1.13 compatible)
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64,garbage_collection_threshold:0.8
+export CUDA_MEMORY_FRACTION=0.90  # Leave more room for gradients
+export TORCH_CUDA_ARCH_LIST="8.0"  # A100 architecture
+
+# Memory optimization environment variables for gradient computation
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+export PYTORCH_JIT=0  # Disable JIT compilation to save memory
+export PYTHONPATH="${PYTHONPATH}:/home/dpereira/CB-LLMs/generation/analysing_pii_leakage"
+export NUMEXPR_NUM_THREADS=1
+
+# Disable unnecessary features to save memory
+export TOKENIZERS_PARALLELISM=false
+export WANDB_DISABLED=true
+
+# Multi-GPU setup (DataParallel instead of DistributedDataParallel)
+export CUDA_VISIBLE_DEVICES=0,1
+
+# Disable wandb logging in headless environment
+export WANDB_DISABLED=true
+export WANDB_MODE=disabled
+
+# Install/update dependencies to fix compatibility
+pip install "numpy<2" torch transformers accelerate peft
+
+# Install the package in editable mode from the right directory
+cd /home/dpereira/CB-LLMs/generation/analysing_pii_leakage
+pip install -e .
+
+# Verify NumPy installation
+python -c "import numpy; print(f'NumPy version: {numpy.__version__}')"
+python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+
+# Debug CUDA setup
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}')"
+
+### --- RUN ---
+cd examples
+echo "🚀 Starting fine-tuning script..."
+
+# Add error handling and process monitoring
+set -e  # Exit on any error
+trap 'echo "Script interrupted at $(date)"' INT TERM
+
+# Start training without timeout limitation
+python fine_tune_lora.py --config_path ../configs/fine-tune/echr-llama3-undefended.yml --root ../../models
+
+echo "✅ Fine-tuning completed successfully at $(date)" 
+

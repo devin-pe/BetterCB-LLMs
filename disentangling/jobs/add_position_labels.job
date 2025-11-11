@@ -1,0 +1,35 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100          # Partition name
+#SBATCH --gres=gpu:1                  # Number of GPUs to allocate
+#SBATCH --cpus-per-task=12            # Number of CPU cores per task
+#SBATCH --job-name=add_pos_labels     # Job name
+#SBATCH --ntasks=1                    # Number of tasks
+#SBATCH --time=6:00:00                # Time limit hh:mm:ss
+#SBATCH --output=/home/dpereira/CB-LLMs/disentangling/work/add_position_labels_%A.out
+
+### --- MODULE SETUP / ENVIRONMENT ---
+module purge
+module load 2023
+
+# Install/update dependencies
+REPO_ROOT=/home/dpereira/CB-LLMs
+pip install -r "$REPO_ROOT/generation/requirements.txt"
+
+# Check if Hugging Face authentication is needed
+echo "Checking Hugging Face access..."
+python -c "from transformers import AutoTokenizer; print('Testing Llama3 access...'); tokenizer = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3-8B'); print('✅ Access successful')" || echo "⚠️  May need HuggingFace authentication"
+
+### --- RUN ---
+cd "$REPO_ROOT/disentangling"
+
+echo "Adding position labels to ECHR dataset..."
+
+# Process all splits (train, validation, test)
+python add_position_labels.py \
+    --base_model_path meta-llama/Meta-Llama-3-8B \
+    --dataset_dir /home/dpereira/CB-LLMs/generation/dataset \
+    --max_length 512 \
+    --splits train validation test
+
+echo "Position labels added successfully!"

@@ -1,0 +1,63 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_h100          # Partition name
+#SBATCH --gres=gpu:1                  # Number of GPUs to allocate
+#SBATCH --cpus-per-task=12            # Number of CPU cores per task
+#SBATCH --gpus=1                      # This line is sometimes optional/redundant depending on your system
+#SBATCH --job-name=eval_ppl_llama3    # Job name (customize)
+#SBATCH --ntasks=1                    # Number of tasks
+#SBATCH --time=12:00:00               # Time limit hh:mm:ss
+#SBATCH --output=/home/dpereira/CB-LLMs/analysing_pii_leakage/work/eval_perplexity_%A.out      # Standard output (%A expands to job ID)
+
+### --- MODULE SETUP / ENVIRONMENT ---
+module purge
+module load 2023
+
+# Fix NumPy/PyTorch compatibility issues
+export NUMPY_EXPERIMENTAL_ARRAY_FUNCTION=0
+export CUDA_LAUNCH_BLOCKING=1
+
+# Set memory management for CUDA
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256
+
+# Install/update dependencies to fix compatibility
+# Use absolute path to generation/requirements.txt
+REPO_ROOT=/home/dpereira/CB-LLMs
+pip install -r "$REPO_ROOT/generation/requirements.txt"
+
+# Check if Hugging Face authentication is needed
+echo "Checking Hugging Face access..."
+python -c "from transformers import AutoTokenizer; print('Testing Llama3 access...'); tokenizer = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3-8B'); print('✅ Access successful')" || echo "⚠️  May need HuggingFace authentication"
+
+# Install datasets package for WikiText-103
+pip install datasets
+
+### --- RUN ---
+cd "$REPO_ROOT/generation"
+
+echo "Starting perplexity evaluation..."
+
+# Evaluate CB-LLM model on WikiText-103 (change --model_type to "regular" for fine-tuned model)
+# echo "Evaluating CB-LLM model on WikiText-103..."
+# python eval_perplexity.py \
+#     --model_path /scratch-shared/tmp.ISacU0WbVs/custom_echr \
+#     --model_type cbllm \
+#     --intervention none \
+#     --stride 512 \
+#     --device auto
+
+python eval_perplexity.py \
+    --model_path /home/dpereira/CB-LLMs/generation/models/4096/custom_echr\
+    --model_type cbllm \
+    --intervention one_zero \
+    --stride 512 \
+    --device auto
+
+# Alternative: To evaluate the regular fine-tuned Llama3-8B model instead, use:
+# python eval_perplexity.py \
+#     --model_path /home/dpereira/CB-LLMs/generation/analysing_pii_leakage/examples/experiments/experiment_00015 \
+#     --model_type regular \
+#     --stride 512 \
+#     --device auto
+
+echo "Perplexity evaluation completed!"

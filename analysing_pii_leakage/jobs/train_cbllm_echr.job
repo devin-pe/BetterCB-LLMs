@@ -1,0 +1,83 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_h100          # Partition name
+#SBATCH --gres=gpu:3                  # Number of GPUs to allocate
+#SBATCH --job-name=train_cbllm_has_person   # Job name
+#SBATCH --ntasks=1                    # Number of tasks
+#SBATCH --time=8:00:00               # Time limit hh:mm:ss
+#SBATCH --output=/home/dpereira/CB-LLMs/analysing_pii_leakage/work/train_cbllm_has_person_%A.out      # Standard output (%A expands to job ID)
+
+### --- MODULE SETUP / ENVIRONMENT ---
+module purge
+module load 2023
+
+# Skip conda activation if it fails - use system Python
+source ~/.bashrc 2>/dev/null || true
+conda activate pii-leakage 2>/dev/null || echo "Using system Python environment"
+
+# Memory optimization environment variables for multi-GPU (matching fine-tuning script)
+export NUMPY_EXPERIMENTAL_ARRAY_FUNCTION=0
+export CUDA_LAUNCH_BLOCKING=1
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64,garbage_collection_threshold:0.8
+export CUDA_MEMORY_FRACTION=0.85
+export TORCH_CUDA_ARCH_LIST="8.0"
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+export PYTORCH_JIT=0
+export NUMEXPR_NUM_THREADS=1
+# Help with model loading performance
+export TRANSFORMERS_CACHE=/tmp/transformers_cache_$SLURM_JOB_ID
+export HF_DATASETS_CACHE=/tmp/datasets_cache_$SLURM_JOB_ID
+export TOKENIZERS_PARALLELISM=false
+export CUDA_VISIBLE_DEVICES=0,1,2
+
+# Fix PyTorch conflicts by uninstalling and reinstalling
+cd /home/dpereira/CB-LLMs/generation
+echo "Fixing PyTorch installation conflicts..."
+pip uninstall -y torch torchvision torchaudio
+pip cache purge
+pip install torch==2.4.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Install other required packages
+pip install -r requirements.txt
+pip install accelerate sentence-transformers flair
+
+# Print versions for debugging
+python -c "import numpy; print(f'NumPy version: {numpy.__version__}')"
+python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+python -c "import transformers; print(f'Transformers version: {transformers.__version__}')"
+python -c "import datasets; print(f'Datasets version: {datasets.__version__}')"
+python -c "import peft; print(f'PEFT version: {peft.__version__}')"
+
+# Debug CUDA setup
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}')"
+
+### --- TRAIN CB-LLM MODEL WITH HAS_PERSON LABELS - 2 GPU VERSION ---
+echo "Starting CB-LLM training with ECHR dataset and has_person binary classification (2 GPU version)..."
+echo "Using fine-tuned Llama3 base model from experiment_00015..."
+
+# Train CB-LLM with has_person binary classification using fine-tuned Llama3
+# With 3 GPUs we have 120GB total memory - should be plenty for CB-LLM components
+python train_CBLLM_multi_gpu.py \
+    --dataset custom_echr \
+    --batch_size 2 \
+    --max_length 300 \
+    --gradient_accumulation_steps 4 \
+    --num_workers 0 
+echo "CB-LLM training completed!"
+
+### --- TRAINING SUMMARY ---
+echo "Training Summary:"
+echo "- Dataset: Custom ECHR with has_person labels"
+echo "- Base Model: Fine-tuned Llama3 from experiment_00015"
+echo "- Task: Binary classification (has_person: 0/1)"
+echo "- Concepts: PII name detection concepts"
+echo "- Model saved to: ./models/from_pretained_llama3_lora_cbm/custom_echr/"
+
+# List generated model files
+echo "Generated model files:"
+ls -la ./models/from_pretained_llama3_lora_cbm/custom_echr/ 2>/dev/null || echo "Model directory not found"
+
+echo "Job completed successfully!"

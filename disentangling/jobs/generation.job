@@ -1,0 +1,46 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100          # Partition name
+#SBATCH --gres=gpu:1                  # Number of GPUs to allocate (3 GPUs for CB-LLM components)
+#SBATCH --cpus-per-task=16            # More CPU cores for 3-GPU setup
+#SBATCH --job-name=test_gen           # Job name
+#SBATCH --ntasks=1                    # Number of tasks
+#SBATCH --time=12:00:00               # Time limit hh:mm:ss (12 hours for training)
+#SBATCH --output=/home/dpereira/CB-LLMs/analysing_pii_leakage/work/test_generation_%A.out      # Standard output (%A expands to job ID)
+
+### --- MODULE SETUP / ENVIRONMENT ---
+module purge
+module load 2023
+module load PyTorch/2.1.2-foss-2023a-CUDA-12.1.1
+
+# Fix NumPy/PyTorch compatibility issues
+export NUMPY_EXPERIMENTAL_ARRAY_FUNCTION=0
+export CUDA_LAUNCH_BLOCKING=1
+
+# Set memory management for CUDA
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256
+
+REPO_ROOT=/home/dpereira/CB-LLMs
+
+# Install/update dependencies (uses the generation/requirements.txt like eval job)
+pip install -r "$REPO_ROOT/generation/requirements.txt"
+
+# Check Hugging Face access for Meta-Llama
+echo "Checking Hugging Face access..."
+python -c "from transformers import AutoTokenizer; print('Testing Llama3 access...'); tokenizer = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3-8B'); print('✅ Access successful')" || echo "⚠️  May need HuggingFace authentication"
+
+# Ensure datasets is installed
+pip install datasets
+
+### --- RUN ---
+cd "$REPO_ROOT/disentangling"
+
+### --- TRAIN CB-LLM MODEL WITH HAS_PERSON LABELS - 2 GPU VERSION ---
+echo "Starting generation..."
+
+python generate_vib.py \
+  --base_model_path /home/dpereira/CB-LLMs/analysing_pii_leakage/examples/experiments/experiment_00015 \
+  --stage1_model_path ~/CB-LLMs/disentangling/models/vib/1/custom_echr/llama3/ \
+  --stage2_model_path ~/CB-LLMs/disentangling/models/vib/2/custom_echr_custom_echr/llama3/ \
+  --gen_length 1000 
+echo "Generation completed!"

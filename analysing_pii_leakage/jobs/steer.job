@@ -1,0 +1,60 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100          # Partition name
+#SBATCH --gres=gpu:1                  # Number of GPUs to allocate
+#SBATCH --cpus-per-task=16            # CPU cores for good performance
+#SBATCH --job-name=steer_cbllm_pii    # Job name
+#SBATCH --ntasks=1                    # Number of tasks
+#SBATCH --time=02:00:00               # Time limit hh:mm:ss (2 hours should be enough)
+#SBATCH --output=/home/dpereira/CB-LLMs/analysing_pii_leakage/work/steer_cbllm_%A.out      # Standard output (%A expands to job ID)
+
+### --- MODULE SETUP / ENVIRONMENT ---
+module purge
+module load 2023
+
+# Skip conda activation if it fails - use system Python
+source ~/.bashrc 2>/dev/null || true
+conda activate pii-leakage 2>/dev/null || echo "Using system Python environment"
+
+# Memory optimization environment variables
+export NUMPY_EXPERIMENTAL_ARRAY_FUNCTION=0
+export CUDA_LAUNCH_BLOCKING=1
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8
+export CUDA_MEMORY_FRACTION=0.95
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+# Install required packages
+cd /home/dpereira/CB-LLMs/generation
+pip install -r requirements.txt
+pip install accelerate sentence-transformers flair
+
+### --- INFORMATION ABOUT THE JOB ---
+echo "Starting PII CB-LLM steering job..."
+echo "Job ID: $SLURM_JOB_ID"
+echo "Job name: $SLURM_JOB_NAME"
+echo "Node: $SLURM_NODELIST"
+echo "Number of CPUs: $SLURM_CPUS_PER_TASK"
+echo "Working directory: $(pwd)"
+echo "Start time: $(date)"
+
+### --- GPU/MEMORY INFO ---
+nvidia-smi
+echo "Available memory:"
+free -h
+
+### --- MAIN TRAINING SCRIPT ---
+echo "Running PII steering script with zero intervention..."
+
+python create_pii_steered_cbllm.py \
+    --model_path models/from_pretained_llama3_lora_cbm/custom_echr/llama3_epoch_2 \
+    --cbl_path models/from_pretained_llama3_lora_cbm/custom_echr/cbl_epoch_2.pt \
+    --output_dir models/pii_steered_zero_intervention_cbllm \
+    --steering_strength 1.0
+
+echo "End time: $(date)"
+echo "PII steering job completed successfully!"
+
+### --- CLEANUP ---
+# Optional: Clean up any temporary files if needed
+echo "Job finished. Check output directory: models/pii_steered_zero_intervention_cbllm"

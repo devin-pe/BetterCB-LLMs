@@ -1,0 +1,40 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100          # Partition name
+#SBATCH --gres=gpu:1                  # Number of GPUs to allocate
+#SBATCH --cpus-per-task=9            # Number of CPU cores per task
+#SBATCH --gpus=1                      # This line is sometimes optional/redundant depending on your system
+#SBATCH --job-name=reconstruction        # Job name (customize)
+#SBATCH --ntasks=1                    # Number of tasks
+#SBATCH --time=24:00:00               # Time limit hh:mm:ss
+#SBATCH --output=/home/dpereira/CB-LLMs/analysing_pii_leakage/work/reconstruction_%A.out      # Standard output (%A expands to job ID)
+
+### --- MODULE SETUP / ENVIRONMENT ---
+module purge
+module load 2023
+# conda create -n pii-leakage python=3.10
+conda activate pii-leakage
+
+# Fix NumPy/PyTorch compatibility issues
+export NUMPY_EXPERIMENTAL_ARRAY_FUNCTION=0
+export CUDA_LAUNCH_BLOCKING=1
+
+# Set memory management for CUDA
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256
+
+# Install/update dependencies to fix compatibility
+pip install "numpy<2" torch transformers accelerate
+pip install -e .
+
+# Verify NumPy installation
+python -c "import numpy; print(f'NumPy version: {numpy.__version__}')"
+python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+
+# Check if Hugging Face authentication is needed
+echo "Checking Hugging Face access..."
+python -c "from transformers import AutoTokenizer; print('Testing Llama3 access...'); tokenizer = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3-8B'); print('✅ Access successful')" || echo "⚠️  May need HuggingFace authentication"
+
+### --- RUN ---
+cd ../examples
+python evaluate.py --config_path ../configs/evaluate/pii-reconstruction-llama3.yml
+

@@ -1,0 +1,42 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100          # Partition name
+#SBATCH --gres=gpu:1                  # Number of GPUs to allocate
+#SBATCH --cpus-per-task=12            # Number of CPU cores per task
+#SBATCH --gpus=1                      # This line is sometimes optional/redundant depending on your system
+#SBATCH --job-name=get_concepts_llama3    # Job name
+#SBATCH --ntasks=1                    # Number of tasks
+#SBATCH --time=04:00:00               # Time limit hh:mm:ss
+#SBATCH --output=/home/dpereira/CB-LLMs/analysing_pii_leakage/work/test_concepts_%A.out      # Standard output
+
+### --- MODULE SETUP / ENVIRONMENT ---
+module purge
+module load 2023
+
+# Fix NumPy/PyTorch compatibility issues
+export NUMPY_EXPERIMENTAL_ARRAY_FUNCTION=0
+export CUDA_LAUNCH_BLOCKING=1
+
+# Set memory management for CUDA
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256
+
+REPO_ROOT=/home/dpereira/CB-LLMs
+
+# Install/update dependencies (uses the generation/requirements.txt like eval job)
+pip install -r "$REPO_ROOT/generation/requirements.txt"
+
+# Check Hugging Face access for Meta-Llama
+echo "Checking Hugging Face access..."
+python -c "from transformers import AutoTokenizer; print('Testing Llama3 access...'); tokenizer = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3-8B'); print('✅ Access successful')" || echo "⚠️  May need HuggingFace authentication"
+
+# Ensure datasets is installed
+pip install datasets
+
+### --- RUN ---
+cd "$REPO_ROOT/generation"
+
+echo "Starting obtain similarity scores..."
+
+python train_CBLLM_multi_gpu.py --dataset custom_echr --concept_similarity_model mpnet
+
+echo "Concept labels obtained!"

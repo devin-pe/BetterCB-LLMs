@@ -1,0 +1,84 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100          # Partition name
+#SBATCH --gres=gpu:1                  # Number of GPUs to allocate
+#SBATCH --job-name=train_cbllm        # Job name
+#SBATCH --ntasks=1                    # Number of tasks
+#SBATCH --time=24:00:00                # Time limit hh:mm:ss
+#SBATCH --output=/home/dpereira/CB-LLMs/disentangling/work/train_%A.out      # Standard output (%A expands to job ID)
+
+### --- MODULE SETUP / ENVIRONMENT ---
+module purge
+module load 2023
+
+# Skip conda activation if it fails - use system Python
+source ~/.bashrc 2>/dev/null || true
+conda activate pii-leakage 2>/dev/null || echo "Using system Python environment"
+
+# Memory optimization environment variables for multi-GPU (matching fine-tuning script)
+export NUMPY_EXPERIMENTAL_ARRAY_FUNCTION=0
+export CUDA_LAUNCH_BLOCKING=1
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64,garbage_collection_threshold:0.8
+export CUDA_MEMORY_FRACTION=0.85
+export TORCH_CUDA_ARCH_LIST="8.0"
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+export PYTORCH_JIT=0
+export NUMEXPR_NUM_THREADS=1
+# Help with model loading performance
+export TRANSFORMERS_CACHE=/tmp/transformers_cache_$SLURM_JOB_ID
+export HF_DATASETS_CACHE=/tmp/datasets_cache_$SLURM_JOB_ID
+export TOKENIZERS_PARALLELISM=false
+export CUDA_VISIBLE_DEVICES=0,1,2
+
+# Fix PyTorch conflicts by uninstalling and reinstalling
+cd /home/dpereira/CB-LLMs/disentangling
+echo "Fixing PyTorch installation conflicts..."
+pip uninstall -y torch torchvision torchaudio
+pip cache purge
+pip install torch==2.4.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Install other required packages
+pip install -r requirements.txt
+pip install accelerate sentence-transformers flair
+
+# Print versions for debugging
+python -c "import numpy; print(f'NumPy version: {numpy.__version__}')"
+python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+python -c "import transformers; print(f'Transformers version: {transformers.__version__}')"
+python -c "import datasets; print(f'Datasets version: {datasets.__version__}')"
+python -c "import peft; print(f'PEFT version: {peft.__version__}')"
+
+# Debug CUDA setup
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}')"
+
+echo "Starting CB-LLM training with ECHR dataset and has_person binary classification..."
+echo "Using fine-tuned Llama3 base model from experiment_00015..."
+
+# Train CB-LLM with has_person binary classification using fine-tuned Llama3
+python training_cbllm.py \
+    --STAGE 1 \
+    --DATA_S1 custom_echr \
+    --LATENT_DIM 128 \
+    --MODEL_NAME llama3 \
+    --LAYER_S1 all \
+    --LEARNING_RATE 1e-4 \
+    --BETA_S1 0.1 \
+    --SEED 42
+# python training_cbllm.py \
+#     --STAGE 2 \
+#     --DATA_S1 custom_echr \
+#     --DATA_S2 custom_echr \
+#     --LATENT_DIM 128 \
+#     --MODEL_NAME llama3 \
+#     --LAYER_S1 all \
+#     --LAYER_S2 all \
+#     --LEARNING_RATE 2e-4 \
+#     --BETA_S1 0.1 \
+#     --BETA_S2 0.0 \
+#     --SEED 42
+echo "CB-LLM training completed!"
+
+echo "Job completed successfully!"

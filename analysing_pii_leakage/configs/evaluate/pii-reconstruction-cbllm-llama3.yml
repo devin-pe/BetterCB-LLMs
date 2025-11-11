@@ -1,0 +1,27 @@
+# Evaluate PII Reconstruction with CB-LLM Steered Llama3
+dataset_args:
+  dataset_path: /gpfs/home6/dpereira/CB-LLMs/generation/analysing_pii_leakage/src/pii_leakage/extern/echr
+  dataset_mode: undefended
+  sample_duplication_rate: 1
+
+attack_args:
+  attack_name: perplexity_reconstruction
+  sampling_rate: 15000
+
+eval_args:
+  num_sequences: 100
+  num_candidates: 100
+
+model_args:
+  architecture: llama3
+  pre_trained: True
+  model_ckpt: /gpfs/home6/dpereira/CB-LLMs/generation/pii_steered_cbllm_echr
+
+ner_args:
+  ner: flair
+  ner_model: flair/ner-english-ontonotes-large
+  anon_token: <MASK>
+  anonymize: False
+
+env_args:
+  eval_batch_size: 8

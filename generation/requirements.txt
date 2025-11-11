@@ -1,0 +1,9 @@
+torch==2.4.0
+transformers==4.44.0
+datasets==3.0.2
+peft==0.13.2
+evaluate==0.4.3
+tqdm
+git+https://github.com/flairNLP/flair
+git+https://github.com/microsoft/dp-transformers.git@main#egg=dp_transformers
+opacus

@@ -1,0 +1,43 @@
+#!/bin/bash
+
+# Job name and output
+#SBATCH --partition=gpu_a100
+#SBATCH --gpus=1      
+#SBATCH --job-name=add_person_ner_echr
+#SBATCH --time=24:00:00               # Time limit hh:mm:ss
+#SBATCH --output=/home/dpereira/CB-LLMs/analysing_pii_leakage/work/add_person_%A.out    
+#SBATCH --nodes=1                    # Number of nodes
+#SBATCH --ntasks=1                   # Number of tasks
+#SBATCH --cpus-per-task=16           # Number of CPU cores per task
+
+# Fail early, but allow safe sourcing of user bashrc
+set -eo pipefail
+
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-4}
+
+mkdir -p logs
+
+cd /home/dpereira/CB-LLMs/generation
+
+# Load environment if needed (adjust to your environment)
+# Some system /etc or user bashrc files reference variables that are not set
+# when the script runs with `set -u` (nounset). Temporarily disable nounset
+# while sourcing to avoid the 'unbound variable' failure.
+if [ -f "$HOME/.bashrc" ]; then
+  set +u
+  # shellcheck disable=SC1090
+  source "$HOME/.bashrc" || true
+  set -u
+fi
+# Try activating a conda env named 'cbllm' if present (non-fatal)
+conda activate cbllm 2>/dev/null || true
+
+echo "Starting add_person_ner on $(date)"
+
+python /home/dpereira/CB-LLMs/generation/add_person_ner.py \
+  --data_dir /home/dpereira/CB-LLMs/generation/dataset \
+  --files echr_train.csv echr_test.csv echr_validation.csv \
+  --batch_size 4 \
+  --use_gpu
+
+echo "Finished add_person_ner on $(date)"
