@@ -2,6 +2,8 @@
 # Licensed under the MIT License.
 
 from dataclasses import dataclass, field
+from typing import Optional
+
 
 @dataclass
 class EvaluationArgs:
@@ -13,4 +15,8 @@ class EvaluationArgs:
 
     num_candidates: int = field(default=10, metadata={
         "help": "number of pii candidates in PII inference attacks to consider"
+    })
+
+    seed: Optional[int] = field(default=None, metadata={
+        "help": "Optional RNG seed to make dataset sampling and candidate selection reproducible"
     })

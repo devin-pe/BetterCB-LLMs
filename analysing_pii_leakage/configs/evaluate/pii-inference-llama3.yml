@@ -1,6 +1,6 @@
 # Evaluate PII Inference
 dataset_args:
-  dataset_path: /home/dpereira/CB-LLMs/generation/analysing_pii_leakage/src/pii_leakage/extern/echr
+  dataset_path: /home/dpereira/CB-LLMs/analysing_pii_leakage/src/pii_leakage/extern/echr
   dataset_mode: undefended
   sample_duplication_rate: 1
 
@@ -10,12 +10,13 @@ attack_args:
 eval_args:
   num_candidates: 100
   num_sequences: 100
+  seed: 42
 
 model_args:
   architecture: llama3
   pre_trained: True
   # Use fine-tuned Llama3 model from experiment_00015
-  model_ckpt: /home/dpereira/CB-LLMs/generation/analysing_pii_leakage/examples/experiments/experiment_00015
+  model_ckpt: /home/dpereira/CB-LLMs/analysing_pii_leakage/examples/experiments/experiment_00015
 
 ner_args:
   ner: flair

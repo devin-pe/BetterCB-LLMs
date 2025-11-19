@@ -20,20 +20,26 @@ export CUDA_LAUNCH_BLOCKING=1
 # Set memory management for CUDA
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256
 
-# Install/update dependencies to fix compatibility
-# Use absolute path to generation/requirements.txt and install analysing_pii_leakage package
 REPO_ROOT=/home/dpereira/CB-LLMs
-pip install -r "$REPO_ROOT/generation/requirements.txt"
 
-# Install the local analysing_pii_leakage package in editable mode
-cd "$REPO_ROOT/generation/analysing_pii_leakage"
-#pip install -e .
+# Avoid pip installing potentially conflicting system packages on shared clusters.
+# Use PYTHONPATH so local packages are importable without altering system/site packages.
+export PYTHONPATH="$REPO_ROOT/analysing_pii_leakage/src:$REPO_ROOT:$PYTHONPATH"
 
-# Check if Hugging Face authentication is needed
-echo "Checking Hugging Face access..."
-python -c "from transformers import AutoTokenizer; print('Testing Llama3 access...'); tokenizer = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3-8B'); print('✅ Access successful')" || echo "⚠️  May need HuggingFace authentication"
+# Optional: check Hugging Face access (doesn't modify environment)
+echo "Checking Hugging Face access (this is a lightweight check)..."
+python - <<'PY'
+try:
+	from transformers import AutoTokenizer
+	print('Testing Llama3 access...')
+	AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3-8B')
+	print('✅ Access successful')
+except Exception as e:
+	print('⚠️  Hugging Face access test failed:', e)
+PY
 
 ### --- RUN ---
-cd examples
-python evaluate.py --config_path ../configs/evaluate/pii-inference-cbllm-llama3.yml
+# Run from the package root so relative config paths work reliably
+cd "$REPO_ROOT/analysing_pii_leakage"
+python examples/evaluate.py --config_path configs/evaluate/pii-inference-llama3.yml
 

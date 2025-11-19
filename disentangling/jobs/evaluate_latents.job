@@ -1,0 +1,42 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100          # Partition name
+#SBATCH --gres=gpu:1                  # Number of GPUs to allocate
+#SBATCH --job-name=eval_stage2_latents # Job name
+#SBATCH --ntasks=1                    # Number of tasks
+#SBATCH --time=04:00:00               # Time limit hh:mm:ss
+#SBATCH --output=/home/dpereira/CB-LLMs/disentangling/work/eval_stages_%A.out      # Standard output (%A expands to job ID)
+
+### --- MODULE SETUP / ENVIRONMENT ---
+module purge
+module load 2023
+
+# Activate conda if available
+source ~/.bashrc 2>/dev/null || true
+conda activate pii-leakage 2>/dev/null || echo "Using system Python environment"
+
+# Recommended environment variables
+export NUMPY_EXPERIMENTAL_ARRAY_FUNCTION=0
+export CUDA_LAUNCH_BLOCKING=1
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64,garbage_collection_threshold:0.8
+export TORCH_CUDA_ARCH_LIST="8.0"
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+export TOKENIZERS_PARALLELISM=false
+export TRANSFORMERS_CACHE=/tmp/transformers_cache_$SLURM_JOB_ID
+export HF_DATASETS_CACHE=/tmp/datasets_cache_$SLURM_JOB_ID
+
+cd /home/dpereira/CB-LLMs/disentangling
+
+echo "Setting up environment and installing requirements..."
+pip install -r requirements.txt || true
+
+echo "Printing versions for debugging"
+python -c "import sys; import torch; import transformers; print('Python:', sys.version.split()[0]); print('PyTorch:', getattr(torch,'__version__', 'n/a')); print('Transformers:', getattr(transformers,'__version__','n/a'))"
+
+echo "Running Stage-2 latent evaluation script"
+python evaluate_latents.py
+
+echo "Evaluation job finished"

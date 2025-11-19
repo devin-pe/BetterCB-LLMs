@@ -1,0 +1,26 @@
+# Evaluate PII Extraction with VIB Stage 2 Model
+dataset_args:
+  dataset_path: /gpfs/home6/dpereira/CB-LLMs/analysing_pii_leakage/src/pii_leakage/extern/echr
+  dataset_mode: undefended
+  sample_duplication_rate: 1
+
+attack_args:
+  attack_name: naive_extraction
+  sampling_rate: 10000
+  seq_len: 256
+
+model_args:
+  architecture: vib
+  pre_trained: True
+  model_ckpt: /home/dpereira/CB-LLMs/disentangling/models/vib/0.01_2/custom_echr_custom_echr/llama3
+  base_model_path: /home/dpereira/CB-LLMs/analysing_pii_leakage/examples/experiments/experiment_00015
+  stage1_model_path: /home/dpereira/CB-LLMs/disentangling/models/vib/1/custom_echr/llama3
+
+ner_args:
+  ner: flair
+  ner_model: flair/ner-english-ontonotes-large
+  anon_token: <MASK>
+  anonymize: False
+
+env_args:
+  eval_batch_size: 8

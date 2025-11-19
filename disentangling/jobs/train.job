@@ -58,27 +58,27 @@ echo "Starting CB-LLM training with ECHR dataset and has_person binary classific
 echo "Using fine-tuned Llama3 base model from experiment_00015..."
 
 # Train CB-LLM with has_person binary classification using fine-tuned Llama3
-python training_cbllm.py \
-    --STAGE 1 \
-    --DATA_S1 custom_echr \
-    --LATENT_DIM 128 \
-    --MODEL_NAME llama3 \
-    --LAYER_S1 all \
-    --LEARNING_RATE 1e-4 \
-    --BETA_S1 0.1 \
-    --SEED 42
 # python training_cbllm.py \
-#     --STAGE 2 \
+#     --STAGE 1 \
 #     --DATA_S1 custom_echr \
-#     --DATA_S2 custom_echr \
 #     --LATENT_DIM 128 \
 #     --MODEL_NAME llama3 \
 #     --LAYER_S1 all \
-#     --LAYER_S2 all \
-#     --LEARNING_RATE 2e-4 \
+#     --LEARNING_RATE 1e-4 \
 #     --BETA_S1 0.1 \
-#     --BETA_S2 0.0 \
 #     --SEED 42
+python training_cbllm.py \
+    --STAGE 2 \
+    --DATA_S1 custom_echr \
+    --DATA_S2 custom_echr \
+    --LATENT_DIM 512 \
+    --MODEL_NAME llama3 \
+    --LAYER_S1 all \
+    --LAYER_S2 all \
+    --LEARNING_RATE 2e-4 \
+    --BETA_S1 0.1 \
+    --BETA_S2 0.1 \
+    --SEED 42
 echo "CB-LLM training completed!"
 
 echo "Job completed successfully!"

@@ -94,7 +94,6 @@ def compute_vib_perplexity(base_model, vib_model, stage1_vib, tokenizer, texts, 
                 hidden_states if layer_idx == 'all' else hidden_states[:, int(layer_idx):int(layer_idx)+1],
                 m=attention_mask,
                 cond=cond,
-                output_attentions=False,
                 noise=False
             )
             logits = outputs_vib[0]
@@ -396,19 +395,6 @@ def evaluate_vib_model(args, device, texts):
         else:
             num_classes = tokenizer.vocab_size  # Language modeling
         
-        # Create VIB config
-        layer_weight_averaging = (args.layer == 'all')
-        vib_config = VIBConfig(
-            input_dim=config.hidden_size,
-            latent_dim=args.latent_dim,
-            stage=args.stage,
-            num_classes=num_classes,
-            layer_weight_averaging=layer_weight_averaging,
-            num_layers=config.num_hidden_layers if layer_weight_averaging else None
-        )
-        
-        vib_model = VIB(vib_config)
-        
         # Construct model filename based on training parameters
         postfix = f"_bs={args.batch_size}_lr={args.learning_rate}_dim={args.latent_dim}"
         if args.no_ib:
@@ -439,6 +425,32 @@ def evaluate_vib_model(args, device, texts):
         
         model_device = next(base_model.parameters()).device if hasattr(base_model, 'parameters') else device
         vib_state_dict = torch.load(model_path, map_location=model_device)
+        
+        # For Stage 2, infer cond_dim from the checkpoint
+        cond_dim = None
+        if args.stage == '2':
+            # Check if there's a projection layer in the checkpoint
+            if 'decoder.cond_projection.weight' in vib_state_dict:
+                cond_dim = vib_state_dict['decoder.cond_projection.weight'].shape[1]
+                logger.info(f"Inferred cond_dim from checkpoint: {cond_dim}")
+            else:
+                # No projection layer means cond_dim equals latent_dim
+                cond_dim = args.latent_dim
+                logger.info(f"No projection layer found, using cond_dim = latent_dim = {cond_dim}")
+        
+        # Create VIB config
+        layer_weight_averaging = (args.layer == 'all')
+        vib_config = VIBConfig(
+            input_dim=config.hidden_size,
+            latent_dim=args.latent_dim,
+            stage=args.stage,
+            num_classes=num_classes,
+            layer_weight_averaging=layer_weight_averaging,
+            num_layers=config.num_hidden_layers if layer_weight_averaging else None,
+            cond_dim=cond_dim
+        )
+        
+        vib_model = VIB(vib_config)
         vib_model.load_state_dict(vib_state_dict)
         vib_model.eval()
         vib_model.to(model_device)
@@ -453,16 +465,6 @@ def evaluate_vib_model(args, device, texts):
                 raise ValueError("Stage 1 model path required for conditioning")
             
             logger.info(f"Loading Stage 1 VIB model from: {args.stage1_model_path}")
-            
-            stage1_config = VIBConfig(
-                input_dim=config.hidden_size,
-                latent_dim=args.latent_dim,
-                stage="1",
-                num_classes=2,
-                layer_weight_averaging=layer_weight_averaging,
-                num_layers=config.num_hidden_layers if layer_weight_averaging else None
-            )
-            stage1_vib = VIB(stage1_config)
             
             # Construct Stage 1 model filename
             s1_postfix = f"_bs={args.batch_size}_lr={args.learning_rate}_dim={args.latent_dim}"
@@ -485,7 +487,21 @@ def evaluate_vib_model(args, device, texts):
                 else:
                     raise FileNotFoundError(f"No Stage 1 model found in {args.stage1_model_path}")
             
+            # Load checkpoint to infer Stage 1's latent dimension
             stage1_state_dict = torch.load(stage1_model_path, map_location=model_device)
+            stage1_latent_dim = stage1_state_dict['encoder.mu.weight'].shape[0]
+            logger.info(f"Inferred Stage 1 latent_dim from checkpoint: {stage1_latent_dim}")
+            
+            # Create Stage 1 model with correct architecture
+            stage1_config = VIBConfig(
+                input_dim=config.hidden_size,
+                latent_dim=stage1_latent_dim,  # Use Stage 1's actual latent_dim
+                stage="1",
+                num_classes=2,
+                layer_weight_averaging=layer_weight_averaging,
+                num_layers=config.num_hidden_layers if layer_weight_averaging else None
+            )
+            stage1_vib = VIB(stage1_config)
             stage1_vib.load_state_dict(stage1_state_dict)
             stage1_vib.eval()
             stage1_vib.to(model_device)

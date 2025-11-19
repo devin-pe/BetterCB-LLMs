@@ -44,6 +44,7 @@ class VIBConfig():
     stage: Optional[str] = None
     layer_weight_averaging: Optional[bool] = False
     num_layers: Optional[int] = None
+    cond_dim: Optional[int] = None  # Dimension of Stage 1 conditioning (for Stage 2 only)
 
 class VariationalEncoder(torch.nn.Module):
     def __init__(self, config):
@@ -67,7 +68,7 @@ class CBLDecoder(torch.nn.Module):
         super(CBLDecoder, self).__init__()
         self.lm_head = torch.nn.Linear(config.latent_dim, config.num_classes)
     
-    def forward(self, z, m=None, cond=None, output_attentions=False):
+    def forward(self, z, m=None, cond=None):
         # z: [batch, seq_len, latent_dim]
         # Per-token prediction: Apply classifier to each token position
         # For sequence labeling tasks (e.g., PERSON token detection)
@@ -78,30 +79,29 @@ class CBLDecoder(torch.nn.Module):
 class TextDecoder(torch.nn.Module):
     def __init__(self, config):
         super(TextDecoder, self).__init__()
-        #self.cond_attention = SelfAttention(config.latent_dim)
-        #self.z_attention = SelfAttention(config.latent_dim)
+        self.latent_dim = config.latent_dim
+        
+        # Projection layer for Stage 1 conditioning if dimensions don't match
+        self.cond_dim = getattr(config, 'cond_dim', config.latent_dim)
+        if self.cond_dim != self.latent_dim:
+            self.cond_projection = torch.nn.Linear(self.cond_dim, self.latent_dim)
+        else:
+            self.cond_projection = None
+        
         self.clf = torch.nn.Linear(config.latent_dim*2, config.num_classes) # latent_dim * 2 due to concatenation
     
     def forward(self, z, m, cond):
         # z: [batch, seq_len, latent_dim] - Stage 2 latent representation
-        # cond: [batch, seq_len, latent_dim] - Stage 1 latent representation (mu from encoder)
+        # cond: [batch, seq_len, cond_dim] - Stage 1 latent representation (mu from encoder)
+        
+        # Project conditioning to match Stage 2 latent dimension if needed
+        if self.cond_projection is not None:
+            cond = self.cond_projection(cond)  # [batch, seq_len, cond_dim] -> [batch, seq_len, latent_dim]
         
         batch_size, seq_len, latent_dim = z.shape
         
-        # Apply attention pooling to both z and cond
-        #attn_out_z = self.z_attention(z, m, output_attentions=output_attentions)
-        #attn_out_cond = self.cond_attention(cond, m, output_attentions=output_attentions)
-        #pooled_z = attn_out_z[0]  # [batch, latent_dim]
-        #pooled_cond = attn_out_cond[0]  # [batch, latent_dim]
-        
-        # Expand pooled representations to each token position for per-token prediction
-        #pooled_cond_expanded = pooled_cond.unsqueeze(1).expand(batch_size, seq_len, latent_dim)  # [batch, seq_len, latent_dim]
-        #pooled_z_expanded = pooled_z.unsqueeze(1).expand(batch_size, seq_len, latent_dim)  # [batch, seq_len, latent_dim]
-        
-        # Concatenate representations at each token position
         concatenated = torch.cat([cond, z], dim=-1)  # [batch, seq_len, latent_dim*2]
         
-        # Apply classifier to get per-token logits
         logits = self.clf(concatenated)  # [batch, seq_len, num_classes]
         
         outputs = (logits,)
@@ -123,7 +123,7 @@ class VIB(torch.nn.Module):
         else:
             raise ValueError("Invalid VIB training stage!")
 
-    def forward(self, h, m=None, cond=None, output_attentions=False, noise=True): 
+    def forward(self, h, m=None, cond=None, noise=True): 
         if self.layer_weight_averaging:
             # compute weighted sum over layers
             w = torch.nn.functional.softmax(self.layer_weights, dim=0)
@@ -131,15 +131,14 @@ class VIB(torch.nn.Module):
 
         mu, var = self.encoder(h)
         std = var ** 0.5
-        # # reparameterization trick: introducing epsilon only during training, and use the z = mu during inference
+        # reparameterization trick: introducing epsilon only during training, and use the z = mu during inference
         if self.training and noise:
             eps = torch.randn_like(std) # sample from N(0, 1)
             z = mu + std * eps 
         else:
             z = mu
 
-        # decoding
-        outputs = self.decoder(z, m, cond, output_attentions)
+        outputs = self.decoder(z, m, cond)
         
         return outputs + (mu, var)
     
@@ -186,10 +185,9 @@ class VIB(torch.nn.Module):
             outputs_vib = self.forward(hidden_states, m=mask, cond=cond)
             logits = outputs_vib[0]  # [batch_size, seq_len, vocab_size]
             
-            # Get logits for the last position (most recent token)
+            # Get logits for the last position
             next_token_logits = logits[:, -1, :].clone()  # [batch_size, vocab_size]
             
-            # Apply repetition penalty
             if repetition_penalty != 1.0:
                 for token_id in set(generated_ids[0].tolist()):
                     # If score < 0, multiply by penalty; if score > 0, divide by penalty
@@ -198,20 +196,16 @@ class VIB(torch.nn.Module):
                     else:
                         next_token_logits[0, token_id] /= repetition_penalty
             
-            # Apply temperature
             next_token_logits = next_token_logits / temp
             
-            # Apply top-k and top-p filtering
             filtered_logits = top_k_top_p_filtering(next_token_logits, top_k=topk, top_p=topp)
             
             # Sample next token
             probs = F.softmax(filtered_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             
-            # Append to sequence
             generated_ids = torch.cat((generated_ids, next_token), dim=-1)
             
-            # Check for EOS token
             if eos_token_id is not None and next_token.item() == eos_token_id:
                 break
         

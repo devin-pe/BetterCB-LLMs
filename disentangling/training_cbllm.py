@@ -45,7 +45,7 @@ BATCH_SIZE = 4 #if STAGE == "1" else 2
 LAYER_S1 = LAYER_S1 if LAYER_S1 == "all" else int(LAYER_S1)
 LAYER_S2 = LAYER_S2 if LAYER_S2 in ["all", None] else int(LAYER_S2)
 BETA = BETA_S1 if STAGE == "1" else BETA_S2
-EPOCHS = 10 if STAGE == "1" else 20
+EPOCHS = 10 if STAGE == "1" else 15
 EVAL_FREQ = 10
 WARMUP_RATIO = 0.1
 WEIGHT_DECAY = 0.005
@@ -185,7 +185,6 @@ def collate_fn(batch):
             "labels": labels
         }
 
-# Load tokenizer and model
 model_path = "/home/dpereira/CB-LLMs/analysing_pii_leakage/examples/experiments/experiment_00015"
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 if tokenizer.pad_token is None:
@@ -197,15 +196,6 @@ base_model.eval()
 
 # Load trained stage 1 vib model if in stage 2
 if STAGE == "2":
-    stage1_config = VIBConfig(
-        input_dim=base_model.config.hidden_size,
-        latent_dim=LATENT_DIM,
-        stage="1",
-        num_classes=2,  # Binary classification for PII
-        layer_weight_averaging=LAYER_S1 == "all",
-        num_layers=base_model.config.num_hidden_layers if LAYER_S1 == "all" else None
-    )
-    stage1_vib = VIB(stage1_config)
     postfix = f"_bs={BATCH_SIZE}_lr={LEARNING_RATE}_dim={LATENT_DIM}"
     if NO_IB:
         postfix += "_noib" 
@@ -215,7 +205,6 @@ if STAGE == "2":
     
     stage1_model_file = f'{LOAD_STAGE1_PATH}model{postfix}.pth'
     
-    # If exact filename not found, look for any model*.pth in the directory
     if not os.path.exists(stage1_model_file):
         print(f"Stage 1 model not found: {stage1_model_file}")
         import glob
@@ -229,14 +218,32 @@ if STAGE == "2":
             print("Please train Stage 1 first!")
             exit(1)
     
-    stage1_vib.load_state_dict(torch.load(stage1_model_file, map_location=device))
+    checkpoint = torch.load(stage1_model_file, map_location=device)
+    stage1_latent_dim = checkpoint['encoder.mu.weight'].shape[0]
+    print(f"Inferred Stage 1 latent_dim from checkpoint: {stage1_latent_dim}")
+    
+    stage1_config = VIBConfig(
+        input_dim=base_model.config.hidden_size,
+        latent_dim=stage1_latent_dim,  
+        stage="1",
+        num_classes=2, 
+        layer_weight_averaging=LAYER_S1 == "all",
+        num_layers=base_model.config.num_hidden_layers if LAYER_S1 == "all" else None
+    )
+    stage1_vib = VIB(stage1_config)
+    stage1_vib.load_state_dict(checkpoint)
     stage1_vib.to(device)
     stage1_vib.eval()
     print(f"Loaded Stage 1 VIB model successfully from {stage1_model_file}")
 
-# Create VIB model for current stage
 layer_weight_averaging = (STAGE == "1" and LAYER_S1 == "all") or (STAGE == "2" and LAYER_S2 == "all")
-num_classes = 2 if STAGE == "1" else tokenizer.vocab_size  # Binary for PII, vocab_size for language modeling
+num_classes = 2 if STAGE == "1" else tokenizer.vocab_size 
+
+if STAGE == "2":
+    print(f"Stage 1 latent_dim: {stage1_latent_dim}, Stage 2 latent_dim: {LATENT_DIM}")
+    cond_dim = stage1_latent_dim
+else:
+    cond_dim = None
 
 vib_config = VIBConfig(
     input_dim=base_model.config.hidden_size,
@@ -244,7 +251,8 @@ vib_config = VIBConfig(
     stage=STAGE,
     num_classes=num_classes,
     layer_weight_averaging=layer_weight_averaging,
-    num_layers=base_model.config.num_hidden_layers if layer_weight_averaging else None
+    num_layers=base_model.config.num_hidden_layers if layer_weight_averaging else None,
+    cond_dim=cond_dim  # Set conditioning dimension for Stage 2
 )
 model = VIB(vib_config)
 model.to(device)
@@ -343,31 +351,43 @@ for epoch in range(EPOCHS):
         else:
             # Stage 2: Language modeling with conditioning from stage 1
             with torch.no_grad():
-                _, cond, _ = stage1_vib(
+                _, mu1, var1 = stage1_vib(
                     hidden_states if LAYER_S1 == "all" else hidden_states[:, LAYER_S1:LAYER_S1+1],
                     m=batch["attention_mask"], 
                     noise=False  # No noise for conditioning
                 ) 
             outputs_vib = model(
                 hidden_states if LAYER_S2 == "all" else hidden_states[:, LAYER_S2:LAYER_S2+1],
-                m=batch["attention_mask"], 
-                cond=cond, 
+                m=batch["attention_mask"],
+                cond=mu1, 
                 noise=not NO_IB
             )
-            logits, mu, var = outputs_vib
-
-        # Info loss (KL divergence)
+            logits, mu, var = outputs_vib        # Info loss (KL divergence)
         if NO_IB:
             info_loss = torch.tensor(0.0, device=device)
         else:
-            info_loss = -0.5 * torch.sum(1 + torch.log(var) - mu.pow(2) - var, dim=-1)
+            if STAGE == "2":
+                # Stage 2: Minimize I(Z1, Z2) via KL(q(z2|h) || q(z1|h))
+                # Project mu1 and var1 to Stage 2 latent dimension if needed
+                if model.decoder.cond_projection is not None:
+                    mu1_proj = model.decoder.cond_projection(mu1)
+                    var1_proj = model.decoder.cond_projection(var1)
+                else:
+                    mu1_proj = mu1
+                    var1_proj = var1
+                
+                # KL(N(mu2, var2) || N(mu1_proj, var1_proj))
+                info_loss = 0.5 * torch.sum(
+                    torch.log(var1_proj / var) + (var + (mu - mu1_proj).pow(2)) / var1_proj - 1,
+                    dim=-1
+                )
+            else:
+                # Stage 1: Minimize I(Z1, H) via KL(q(z1|h) || N(0,1))
+                info_loss = -0.5 * torch.sum(1 + torch.log(var) - mu.pow(2) - var, dim=-1)
             info_loss = torch.masked_select(info_loss, batch["attention_mask"].bool()).mean()
         
-        # Task loss
         if STAGE == "1":
             # Token-level sequence labeling loss
-            # logits: [batch, seq_len, 2] for binary classification per token
-            # labels: [batch, seq_len] with 0/1 values
             batch_size, seq_len, num_classes = logits.shape
             
             # Flatten for loss calculation
@@ -378,15 +398,9 @@ for epoch in range(EPOCHS):
             flat_mask = batch["attention_mask"].view(batch_size * seq_len).bool()
             
             # Compute loss only on non-padded tokens
-            task_loss = F.cross_entropy(
-                flat_logits[flat_mask], 
-                flat_labels[flat_mask]
-            )
+            task_loss = F.cross_entropy(flat_logits[flat_mask], flat_labels[flat_mask])
         else:
-            # Language modeling loss (autoregressive, token-by-token)
-            # logits: [batch, seq_len, vocab_size]
-            # labels: [batch, seq_len]
-            # Shift so that tokens < n predict n
+            # Language modeling loss 
             shift_logits = logits[:, :-1, :].contiguous()  # [batch, seq_len-1, vocab_size]
             shift_labels = batch['labels'][:, 1:].contiguous()  # [batch, seq_len-1]
             
@@ -457,14 +471,14 @@ for epoch in range(EPOCHS):
                     )
             else:
                 with torch.no_grad():
-                    _, cond, _ = stage1_vib(
+                    _, mu1, var1 = stage1_vib(
                         hidden_states if LAYER_S1 == "all" else hidden_states[:, LAYER_S1:LAYER_S1+1],
                         m=batch["attention_mask"]
                     ) 
                     outputs_vib = model(
                         hidden_states if LAYER_S2 == "all" else hidden_states[:, LAYER_S2:LAYER_S2+1],
                         m=batch["attention_mask"], 
-                        cond=cond, 
+                        cond=mu1, 
                     )
                 logits, _, _ = outputs_vib  # Unpack (logits, mu, var)
                 

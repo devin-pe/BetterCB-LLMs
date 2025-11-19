@@ -5,6 +5,7 @@ import random
 from copy import deepcopy
 
 import numpy as np
+import pandas as pd
 import transformers
 from tqdm import tqdm
 
@@ -55,6 +56,24 @@ def evaluate(model_args: ModelArgs,
         env_args = config_args.get_env_args()
 
     print_dict_highlighted(vars(attack_args))
+
+    # Seed RNGs for reproducibility when requested
+    seed = getattr(eval_args, 'seed', None)
+    if seed is not None:
+        import random as _random, numpy as _np
+        _random.seed(seed)
+        _np.random.seed(seed)
+        try:
+            import torch as _torch
+            _torch.manual_seed(seed)
+            if _torch.cuda.is_available():
+                _torch.cuda.manual_seed_all(seed)
+                _torch.backends.cudnn.deterministic = True
+                _torch.backends.cudnn.benchmark = False
+        except Exception:
+            # torch may not be available in some environments; continue without torch seeding
+            pass
+        print(f"RNGs seeded with seed={seed}")
 
     # Load the target model (trained on private data)
     lm: LanguageModel = ModelFactory.from_model_args(model_args, env_args=env_args).load(verbose=True)
@@ -126,6 +145,9 @@ def evaluate(model_args: ModelArgs,
         dataset = train_dataset.select(idx)  # dict with 'text': seq and 'entity_class': 'ListPII (as a str)'
 
         tagger = TaggerFactory.from_ner_args(ner_args, env_args=env_args)
+        
+        results_data = {"Predicted": [], "True": [], "Sequence": []}
+        
         with tqdm(total=eval_args.num_sequences, desc="Evaluate Reconstruction") as pbar:
             y_preds, y_trues = [], []
             sequences_processed = 0
@@ -207,6 +229,12 @@ def evaluate(model_args: ModelArgs,
 
                 y_preds += [predicted_target_pii]
                 y_trues += [target_pii]
+                
+                # Store in dataframe
+                results_data["Predicted"].append(predicted_target_pii)
+                results_data["True"].append(target_pii)
+                results_data["Sequence"].append(target_sequence)
+                
                 sequences_processed += 1
 
                 acc = np.mean([1 if y_preds[i] == y_trues[i] else 0 for i in range(len(y_preds))])
@@ -214,6 +242,13 @@ def evaluate(model_args: ModelArgs,
                 pbar.update(1)
                 
             print(f"\nCompleted: {sequences_processed} valid sequences processed from {sequences_examined} examined")
+        
+        # Save results to CSV
+        if sequences_processed > 0:
+            results_df = pd.DataFrame(results_data)
+            output_path = "/home/dpereira/CB-LLMs/disentangling/work/check_vib.csv"
+            results_df.to_csv(output_path, index=False)
+            print(f"\nSaved {len(results_df)} predictions to {output_path}")
     else:
         raise ValueError(f"Unknown attack type: {type(attack)}")
 

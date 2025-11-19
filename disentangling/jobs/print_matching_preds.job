@@ -1,0 +1,25 @@
+#!/bin/bash
+
+#SBATCH --partition=cbuild 
+#SBATCH --ntasks=1                    # Number of tasks
+#SBATCH --cpus-per-task=4             # Number of CPU cores
+#SBATCH --time=01:00:00               # Time limit hh:mm:ss
+#SBATCH --job-name=print_preds         # Job name
+#SBATCH --output=/home/dpereira/CB-LLMs/disentangling/work/print_matching_preds_%A.out
+
+### --- MODULE SETUP / ENVIRONMENT ---
+module purge
+module load 2023
+
+# Use conda environment if available, otherwise system Python
+source ~/.bashrc 2>/dev/null || true
+conda activate pii-leakage 2>/dev/null || echo "Using system Python environment"
+
+REPO_ROOT=/home/dpereira/CB-LLMs
+export PYTHONPATH="$REPO_ROOT:$REPO_ROOT/analysing_pii_leakage/src:$PYTHONPATH"
+
+
+### --- RUN ---
+python print_matching_preds.py 
+
+echo "Done. Output written to /home/dpereira/CB-LLMs/disentangling/work/print_matching_preds_%A.out"
