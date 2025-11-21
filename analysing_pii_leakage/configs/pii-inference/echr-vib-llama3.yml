@@ -13,7 +13,7 @@ attack_args:
 model_args:
   architecture: vib
   pre_trained: True
-  model_ckpt: /home/dpereira/CB-LLMs/disentangling/models/vib/2/custom_echr_custom_echr/llama3
+  model_ckpt: /home/dpereira/CB-LLMs/disentangling/models/vib/copy2/custom_echr_custom_echr/llama3
   base_model_path: /home/dpereira/CB-LLMs/analysing_pii_leakage/examples/experiments/experiment_00015
   stage1_model_path: /home/dpereira/CB-LLMs/disentangling/models/vib/1/custom_echr/llama3
 

@@ -36,7 +36,7 @@ pip install datasets
 cd "$REPO_ROOT/disentangling"
 
 python perplexity.py \
-    --model_path ~/CB-LLMs/disentangling/models/vib/0.01_2/custom_echr_custom_echr/llama3/ \
+    --model_path ~/CB-LLMs/disentangling/models/vib/pretrained2/custom_echr_custom_echr/llama3/ \
     --base_model_path /home/dpereira/CB-LLMs/analysing_pii_leakage/examples/experiments/experiment_00015 \
     --model_type vib \
     --stage 2 \

@@ -41,6 +41,14 @@ class SamplingArgs:
         "help": "whether to sample the model. "
     })
 
+    temperature: float = field(default=1.0, metadata={
+        "help": "Temperature for sampling. Lower values make output more deterministic."
+    })
+
+    repetition_penalty: float = field(default=1.0, metadata={
+        "help": "Repetition penalty. Values > 1.0 discourage repetition."
+    })
+
     generate_verbose: bool = field(default=False, metadata={
         "help": "whether to generate data verbose."
     })

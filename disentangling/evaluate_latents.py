@@ -158,7 +158,7 @@ def main():
     print('Loading test dataset...')
     test_ds = load_echr_data(args.data_path, 'validation', args.max_length)
     test_ds = test_ds.map(lambda b: prepare_dataset_stage1(b, tokenizer, args.max_length), batched=True)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=2)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=0)
 
     # Evaluate both Stage-1 and Stage-2 latents
     print('Evaluating Stage-1 and Stage-2 latents with Stage-1 decoder on test labels...')

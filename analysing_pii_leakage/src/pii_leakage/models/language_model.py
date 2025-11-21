@@ -172,6 +172,7 @@ class LanguageModel:
             do_sample=sampling_args.do_sample,
             top_k=sampling_args.top_k,
             top_p=sampling_args.top_p,
+            temperature=sampling_args.temperature,
             output_scores=False,
             return_dict_in_generate=True
         )
@@ -260,7 +261,7 @@ class LanguageModel:
                 except StopIteration:
                     # Model has no parameters, use env device
                     input_ids = input_ids.to(self.env_args.device)
-                
+            
             target_ids = input_ids.clone()
 
             if offset > 0:  # ignore everything up to the offset

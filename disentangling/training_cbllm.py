@@ -10,6 +10,7 @@ parser.add_argument("--LAYER_S2", type=str, default="all")
 parser.add_argument("--LEARNING_RATE", type=float, default=1e-4)
 parser.add_argument("--BETA_S1", type=float, default=0.1)
 parser.add_argument("--BETA_S2", type=float, default=0.1)
+parser.add_argument("--BETA_S2_INFO2", type=float, default=0.01)  # Beta for info_loss2 (I(Z2,H))
 parser.add_argument("--SEED", type=int, default=42)
 parser.add_argument("--NO_IB", action='store_true')
 parser.add_argument("--MAX_LENGTH", type=int, default=512)
@@ -25,6 +26,7 @@ LAYER_S2 = args.LAYER_S2
 LEARNING_RATE = args.LEARNING_RATE
 BETA_S1 = args.BETA_S1
 BETA_S2 = args.BETA_S2
+BETA_S2_INFO2 = args.BETA_S2_INFO2
 NO_IB = args.NO_IB
 SEED = args.SEED
 MAX_LENGTH = args.MAX_LENGTH
@@ -41,11 +43,11 @@ if STAGE == "1":
 else:
     OBJECTIVE = "next_word"
     
-BATCH_SIZE = 4 #if STAGE == "1" else 2
+BATCH_SIZE = 4  # Use batch size of 4 for both stages with H100
 LAYER_S1 = LAYER_S1 if LAYER_S1 == "all" else int(LAYER_S1)
 LAYER_S2 = LAYER_S2 if LAYER_S2 in ["all", None] else int(LAYER_S2)
 BETA = BETA_S1 if STAGE == "1" else BETA_S2
-EPOCHS = 10 if STAGE == "1" else 15
+EPOCHS = 10 if STAGE == "1" else 10
 EVAL_FREQ = 10
 WARMUP_RATIO = 0.1
 WEIGHT_DECAY = 0.005
@@ -58,8 +60,8 @@ print(f"Task objective: {OBJECTIVE}")
 # Paths
 DATA_PATH = "/home/dpereira/CB-LLMs/generation/dataset/"
 LOAD_STAGE1_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/models/vib/1/{DATA_S1}/{MODEL_NAME}/"
-SAVE_REPORTS_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/reports/vib/{STAGE}/{DATA_}/{MODEL_NAME}/"
-SAVE_MODEL_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/models/vib/{STAGE}/{DATA_}/{MODEL_NAME}/"
+SAVE_REPORTS_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/reports/vib/autoencoder{STAGE}/{DATA_}/{MODEL_NAME}/"
+SAVE_MODEL_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/models/vib/autoencoder{STAGE}/{DATA_}/{MODEL_NAME}/"
 
 ## Imports
 import pickle
@@ -190,9 +192,17 @@ tokenizer = AutoTokenizer.from_pretrained(model_path)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-base_model = LlamaModel.from_pretrained(model_path)
+base_model = LlamaModel.from_pretrained(
+    model_path,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    low_cpu_mem_usage=True
+)
 base_model.to(device)
 base_model.eval()
+
+# Enable gradient checkpointing for memory efficiency
+if hasattr(base_model, 'gradient_checkpointing_enable'):
+    base_model.gradient_checkpointing_enable()
 
 # Load trained stage 1 vib model if in stage 2
 if STAGE == "2":
@@ -233,6 +243,8 @@ if STAGE == "2":
     stage1_vib = VIB(stage1_config)
     stage1_vib.load_state_dict(checkpoint)
     stage1_vib.to(device)
+    if torch.cuda.is_available():
+        stage1_vib = stage1_vib.half()  # Convert to float16 for LLaMA3 compatibility
     stage1_vib.eval()
     print(f"Loaded Stage 1 VIB model successfully from {stage1_model_file}")
 
@@ -256,6 +268,9 @@ vib_config = VIBConfig(
 )
 model = VIB(vib_config)
 model.to(device)
+if torch.cuda.is_available() and STAGE == "2":
+    model = model.half()  # Convert to float16 for LLaMA3 compatibility
+    
 model.train()
 
 # Load data
@@ -321,11 +336,14 @@ for epoch in range(EPOCHS):
     model.train()
     epoch_task_loss = 0
     epoch_info_loss = 0
+    epoch_mse_loss = 0
     epoch_total_loss = 0
     
     for step, batch in enumerate(train_dataloader):
         # Move batch to device
         batch = {k: v.to(device) for k, v in batch.items()}
+        
+        mse_loss = torch.tensor(0.0, device=device)
         
         # Feature extraction from pre-trained language model
         with torch.no_grad():
@@ -339,6 +357,10 @@ for epoch in range(EPOCHS):
         hidden_states = torch.stack(outputs.hidden_states)
         # Transform to batch-first and skip embedding layer
         hidden_states = hidden_states[1:].permute(1, 0, 2, 3)  # (batch, layers, seq, hidden)
+        
+        # Clear cache after base model forward pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         # Forward VIB model
         if STAGE == "1":
@@ -362,27 +384,39 @@ for epoch in range(EPOCHS):
                 cond=mu1, 
                 noise=not NO_IB
             )
-            logits, mu, var = outputs_vib        # Info loss (KL divergence)
+            logits, hidden_repr, mu, var = outputs_vib 
         if NO_IB:
             info_loss = torch.tensor(0.0, device=device)
         else:
             if STAGE == "2":
+                eps = 1e-6
+                var = var.clamp(min=eps)
+                
                 # Stage 2: Minimize I(Z1, Z2) via KL(q(z2|h) || q(z1|h))
                 # Project mu1 and var1 to Stage 2 latent dimension if needed
                 if model.decoder.cond_projection is not None:
                     mu1_proj = model.decoder.cond_projection(mu1)
-                    var1_proj = model.decoder.cond_projection(var1)
+                    var1_proj = model.decoder.cond_projection(var1).clamp(min=eps)
                 else:
                     mu1_proj = mu1
-                    var1_proj = var1
+                    var1_proj = var1.clamp(min=eps)
                 
                 # KL(N(mu2, var2) || N(mu1_proj, var1_proj))
                 info_loss = 0.5 * torch.sum(
                     torch.log(var1_proj / var) + (var + (mu - mu1_proj).pow(2)) / var1_proj - 1,
                     dim=-1
                 )
+                
+                # Stage 2: Minimize MSE loss between decoder hidden_repr and LLaMA3 last hidden state
+                # Get LLaMA3's last hidden state from outputs
+                llama3_last_hidden = hidden_states[:, -1, :, :]  # [batch, seq_len, hidden_dim]
+                
+                # MSE loss between hidden representations
+                mse_loss = F.mse_loss(hidden_repr, llama3_last_hidden, reduction='none').mean(dim=-1)
+                mse_loss = torch.masked_select(mse_loss, batch["attention_mask"].bool()).mean()
             else:
                 # Stage 1: Minimize I(Z1, H) via KL(q(z1|h) || N(0,1))
+                var = var.clamp(min=1e-6)
                 info_loss = -0.5 * torch.sum(1 + torch.log(var) - mu.pow(2) - var, dim=-1)
             info_loss = torch.masked_select(info_loss, batch["attention_mask"].bool()).mean()
         
@@ -412,8 +446,8 @@ for epoch in range(EPOCHS):
             # Ignore padding tokens
             task_loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=tokenizer.pad_token_id)
         
-        # Total loss
-        total_loss = task_loss + beta * info_loss 
+        beta2 = BETA_S2_INFO2 if STAGE == "2" else 0.0
+        total_loss = task_loss + beta * info_loss + beta2 * mse_loss
 
         # Optimization
         total_loss.backward()
@@ -426,6 +460,8 @@ for epoch in range(EPOCHS):
         epoch_task_loss += task_loss.item()
         if not NO_IB:
             epoch_info_loss += info_loss.item()
+        if STAGE == "2":
+            epoch_mse_loss += mse_loss.item()
         epoch_total_loss += total_loss.item()
         
         if BETA == "incremental":
@@ -437,9 +473,15 @@ for epoch in range(EPOCHS):
         train_losses['Info'].append(epoch_info_loss / len(train_dataloader))
         train_losses['Total'].append(epoch_total_loss / len(train_dataloader))
 
-    print(f"Epoch {epoch+1}/{EPOCHS}, Task Loss: {epoch_task_loss/len(train_dataloader):.4f}, "
-          f"Info Loss: {epoch_info_loss/len(train_dataloader):.4f}, "
-          f"Total Loss: {epoch_total_loss/len(train_dataloader):.4f}")
+    if STAGE == "2":
+        print(f"Epoch {epoch+1}/{EPOCHS}, Task Loss: {epoch_task_loss/len(train_dataloader):.4f}, "
+              f"Info Loss: {epoch_info_loss/len(train_dataloader):.4f}, "
+              f"MSE Loss: {epoch_mse_loss/len(train_dataloader):.4f}, "
+              f"Total Loss: {epoch_total_loss/len(train_dataloader):.4f}")
+    else:
+        print(f"Epoch {epoch+1}/{EPOCHS}, Task Loss: {epoch_task_loss/len(train_dataloader):.4f}, "
+              f"Info Loss: {epoch_info_loss/len(train_dataloader):.4f}, "
+              f"Total Loss: {epoch_total_loss/len(train_dataloader):.4f}")
 
     # Evaluation
     if (epoch + 1) % EVAL_FREQ == 0:
@@ -480,7 +522,7 @@ for epoch in range(EPOCHS):
                         m=batch["attention_mask"], 
                         cond=mu1, 
                     )
-                logits, _, _ = outputs_vib  # Unpack (logits, mu, var)
+                logits = outputs_vib[0]  # Extract logits (outputs_vib is (logits, hidden_repr, mu, var))
                 
             # Compute predictions
             if STAGE == "1":
