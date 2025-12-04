@@ -33,6 +33,16 @@ def parse_args():
     parser.add_argument("--BETA_S1", type=float, default=0.1)
     parser.add_argument("--BETA_S2", type=float, default=0.0)
     parser.add_argument("--BETA_S2_MSE", type=float, default=2.5)
+    parser.add_argument("--var_clamp_min", type=float, default=0.1,
+                        help='Minimum variance clamp value used in the encoder (default: 0.1)')
+    parser.add_argument("--var_clamp_max", type=float, default=10.0,
+                        help='Maximum variance clamp value used in the encoder (default: 10.0)')
+    parser.add_argument("--beta_s2_start", type=float, default=None,
+                        help='Starting beta_s2 for annealing (default: use BETA_S2)')
+    parser.add_argument("--beta_s2_end", type=float, default=None,
+                        help='Ending beta_s2 for annealing (default: use BETA_S2)')
+    parser.add_argument("--beta_s2_warmup_epochs", type=int, default=0,
+                        help='Number of epochs to linearly anneal beta_s2 from start to end (0=no annealing)')
     parser.add_argument("--SEED", type=int, default=42)
     parser.add_argument("--NO_IB", action='store_true')
     parser.add_argument("--MAX_LENGTH", type=int, default=512)
@@ -129,6 +139,9 @@ def main():
         layer_weight_averaging=layer_s1 == "all",
         num_layers=base_model.config.num_hidden_layers if layer_s1 == "all" else None
     )
+    # Pass variance clamp settings to Stage 1 config as well (harmless if not used)
+    stage1_config.var_clamp_min = args.var_clamp_min
+    stage1_config.var_clamp_max = args.var_clamp_max
     stage1_vib = VIB(stage1_config)
     stage1_vib.load_state_dict(checkpoint)
     stage1_vib.to(device)
@@ -152,6 +165,9 @@ def main():
         num_layers=base_model.config.num_hidden_layers if layer_weight_averaging else None,
         cond_dim=stage1_latent_dim
     )
+    # Configure variance clamp bounds for Stage 2 encoder
+    vib_config.var_clamp_min = args.var_clamp_min
+    vib_config.var_clamp_max = args.var_clamp_max
     model = VIB(vib_config)
     model.to(device)
     model.train()
@@ -237,9 +253,18 @@ def main():
     )
     print("[DEBUG] LR scheduler created successfully")
     
-    beta = float(args.BETA_S2)
+    # Setup beta_s2 annealing
+    beta_s2_start = args.beta_s2_start if args.beta_s2_start is not None else args.BETA_S2
+    beta_s2_end = args.beta_s2_end if args.beta_s2_end is not None else args.BETA_S2
+    beta_s2_warmup_epochs = args.beta_s2_warmup_epochs
+    
+    if beta_s2_warmup_epochs > 0:
+        print(f"[INFO] Beta_S2 annealing enabled: {beta_s2_start:.6f} -> {beta_s2_end:.6f} over {beta_s2_warmup_epochs} epochs")
+    else:
+        print(f"[INFO] Beta_S2 fixed at {args.BETA_S2}")
+    
     beta_mse = float(args.BETA_S2_MSE)
-    print(f"[DEBUG] Beta values set: beta={beta}, beta_mse={beta_mse}")
+    print(f"[DEBUG] Beta MSE set: beta_mse={beta_mse}")
     
     # Training loop
     train_losses = {'Task': [], 'Info': [], 'MSE': [], 'Total': []}
@@ -254,7 +279,19 @@ def main():
     
     print("[DEBUG] Entering training loop...")
     for epoch in range(args.EPOCHS):
-        print(f"\n[DEBUG] ========== Starting Epoch {epoch+1}/{args.EPOCHS} ==========")
+        print(f"\n[DEBUG] ========== Starting Epoch {epoch+1}/{args.EPOCHS} ===========")
+        
+        # Compute annealed beta_s2 for current epoch
+        if beta_s2_warmup_epochs > 0 and epoch < beta_s2_warmup_epochs:
+            # Linear warmup from beta_s2_start to beta_s2_end
+            progress = epoch / beta_s2_warmup_epochs
+            beta = beta_s2_start + progress * (beta_s2_end - beta_s2_start)
+        else:
+            # After warmup, use final value
+            beta = beta_s2_end
+        
+        print(f"[INFO] Epoch {epoch+1}: beta_s2 = {beta:.6f}")
+        
         model.train()
         epoch_task_loss = 0
         epoch_info_loss = 0
@@ -304,7 +341,7 @@ def main():
             
             # Get Stage 1 conditioning
             with torch.no_grad():
-                _, mu1, var1 = stage1_vib(
+                _, mu1, _ = stage1_vib(
                     hidden_states if layer_s1 == "all" else hidden_states[:, layer_s1:layer_s1+1],
                     m=batch["attention_mask"], 
                     noise=False 
@@ -317,26 +354,11 @@ def main():
                 cond=mu1, 
                 noise=not args.NO_IB
             )
-            logits, merged_latents, mu2, var2 = outputs_vib
+            logits, merged_latents, mu, var = outputs_vib
             
-            # Compute information loss (KL divergence between Stage 2 and Stage 1)
-            # Debug: Print variance statistics
-            if torch.isnan(var1).any() or torch.isnan(var2).any() or torch.isinf(var1).any() or torch.isinf(var2).any():
-                print(f"[DEBUG] WARNING at epoch {epoch+1}, step {step}: Invalid variance detected!")
-                print(f"  var1 - min: {var1.min().item():.6e}, max: {var1.max().item():.6e}, mean: {var1.mean().item():.6e}")
-                print(f"  var2 - min: {var2.min().item():.6e}, max: {var2.max().item():.6e}, mean: {var2.mean().item():.6e}")
-                print(f"  var1 has NaN: {torch.isnan(var1).any()}, var1 has Inf: {torch.isinf(var1).any()}")
-                print(f"  var2 has NaN: {torch.isnan(var2).any()}, var2 has Inf: {torch.isinf(var2).any()}")
             
-            # KL(q2 || q1) where q2 is Stage 2 posterior, q1 is Stage 1 posterior
-            var_ratio = var2 / var1
-            log_var_ratio = torch.log(var_ratio)
-            mu_diff_sq = (mu1 - mu2).pow(2)
-            scaled_term = (var1 + mu_diff_sq) / var2
-            kl_div = 0.5 * (log_var_ratio + scaled_term - 1.0)
-
-            
-            info_loss = - kl_div.masked_select(sym_kl.sum(dim=-1), batch["attention_mask"].bool()).mean()
+            info_loss = -0.5 * torch.sum(1 + torch.log(var) - mu.pow(2) - var, dim=-1)
+            info_loss = torch.masked_select(info_loss, batch["attention_mask"].bool()).mean()
             
             # Compute MSE regression to LLaMA3's last hidden layer
             mse_loss = F.mse_loss(merged_latents, llama3_last_hidden, reduction='none').mean(dim=-1)
@@ -364,10 +386,8 @@ def main():
                 print(f"  info_loss: {info_loss.item() if not torch.isnan(info_loss) else 'NaN'}")
                 print(f"  mse_loss: {mse_loss.item():.4f}")
                 print(f"  beta: {beta}, beta_mse: {beta_mse}")
-                print(f"  mu1 stats - min: {mu1.min().item():.6e}, max: {mu1.max().item():.6e}, mean: {mu1.mean().item():.6e}")
-                print(f"  mu2 stats - min: {mu2.min().item():.6e}, max: {mu2.max().item():.6e}, mean: {mu2.mean().item():.6e}")
-                print(f"  var1 stats - min: {var1.min().item():.6e}, max: {var1.max().item():.6e}, mean: {var1.mean().item():.6e}")
-                print(f"  var2 stats - min: {var2.min().item():.6e}, max: {var2.max().item():.6e}, mean: {var2.mean().item():.6e}")
+                print(f"  mu stats - min: {mu.min().item():.6e}, max: {mu.max().item():.6e}, mean: {mu.mean().item():.6e}")
+                print(f"  var stats - min: {var.min().item():.6e}, max: {var.max().item():.6e}, mean: {var.mean().item():.6e}")
                 print("  Stopping training to prevent NaN propagation.")
                 break
             
@@ -379,11 +399,8 @@ def main():
                 print(f"  mse_loss: {mse_loss.item():.4f}")
                 print(f"  beta: {beta}, beta_mse: {beta_mse}")
                 print(f"  Breakdown: task={task_loss.item():.4f} + beta*info={beta}*{info_loss.item():.4f} + beta_mse*mse={beta_mse}*{mse_loss.item():.4f}")
-                print(f"  mu1 stats - min: {mu1.min().item():.6e}, max: {mu1.max().item():.6e}, mean: {mu1.mean().item():.6e}")
-                print(f"  mu2 stats - min: {mu2.min().item():.6e}, max: {mu2.max().item():.6e}, mean: {mu2.mean().item():.6e}")
-                print(f"  var1 stats - min: {var1.min().item():.6e}, max: {var1.max().item():.6e}, mean: {var1.mean().item():.6e}")
-                print(f"  var2 stats - min: {var2.min().item():.6e}, max: {var2.max().item():.6e}, mean: {var2.mean().item():.6e}")
-                print(f"  var_ratio (var2/var1) - min: {(var2/var1).min().item():.6e}, max: {(var2/var1).max().item():.6e}")
+                print(f"  mu stats - min: {mu.min().item():.6e}, max: {mu.max().item():.6e}, mean: {mu.mean().item():.6e}")
+                print(f"  var stats - min: {var.min().item():.6e}, max: {var.max().item():.6e}, mean: {var.mean().item():.6e}")
             
             # Backward pass with gradient clipping
             total_loss.backward()
@@ -445,7 +462,7 @@ def main():
                 
                 # Get Stage 1 conditioning
                 with torch.no_grad():
-                    _, mu1, var1 = stage1_vib(
+                    _, mu1, _ = stage1_vib(
                         hidden_states if layer_s1 == "all" else hidden_states[:, layer_s1:layer_s1+1],
                         m=batch["attention_mask"]
                     )
