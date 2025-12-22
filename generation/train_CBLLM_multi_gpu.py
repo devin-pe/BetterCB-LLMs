@@ -73,7 +73,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(1)
 
 # Load tokenizer and config from the fine-tuned model for consistency
-fine_tuned_model_path = "/home/dpereira/CB-LLMs/generation/analysing_pii_leakage/examples/experiments/experiment_00015"
+fine_tuned_model_path = "/home/dpereira/CB-LLMs/analysing_pii_leakage/examples/experiments/experiment_00015"
 tokenizer = AutoTokenizer.from_pretrained(fine_tuned_model_path)
 if tokenizer.pad_token is None:
     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
@@ -98,16 +98,19 @@ elif args.dataset == 'custom_echr':
     print("loading data...")
     print("Loading custom ECHR dataset with has_person labels...")
     
-    # Load the separate train and validation datasets
+    # Load the separate train, validation, and test datasets
     train_data = pd.read_csv("/home/dpereira/CB-LLMs/generation/dataset/echr_train.csv")
     val_data = pd.read_csv("/home/dpereira/CB-LLMs/generation/dataset/echr_validation.csv")
+    test_data = pd.read_csv("/home/dpereira/CB-LLMs/generation/dataset/echr_test.csv")
     
     print(f"Loaded ECHR training dataset with {len(train_data)} samples")
     print(f"Loaded ECHR validation dataset with {len(val_data)} samples")
+    print(f"Loaded ECHR test dataset with {len(test_data)} samples")
     
     # Print distribution of has_person labels
     print(f"Training has_person distribution: {train_data['has_person'].value_counts().to_dict()}")
     print(f"Validation has_person distribution: {val_data['has_person'].value_counts().to_dict()}")
+    print(f"Test has_person distribution: {test_data['has_person'].value_counts().to_dict()}")
     
     train_dataset = Dataset.from_dict({
         'text': train_data['fact'].tolist(),
@@ -119,8 +122,14 @@ elif args.dataset == 'custom_echr':
         'label': val_data['has_person'].tolist()
     })
     
+    test_dataset = Dataset.from_dict({
+        'text': test_data['fact'].tolist(),
+        'label': test_data['has_person'].tolist()
+    })
+    
     print(f"Training samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
+    print(f"Test samples: {len(test_dataset)}")
     
     # Print label distribution for training set
     train_labels = np.array(train_dataset['label'])
@@ -143,6 +152,13 @@ if args.dataset in ['SetFit/sst2', 'custom_echr']:
             batch_size=len(val_dataset))
         encoded_val_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
         encoded_val_dataset = encoded_val_dataset[:len(encoded_val_dataset)]
+        
+        if args.dataset == 'custom_echr':
+            encoded_test_dataset = test_dataset.map(
+                lambda e: tokenizer(e[CFG.example_name[args.dataset]], padding=True, truncation=True, max_length=args.max_length), batched=True,
+                batch_size=len(test_dataset))
+            encoded_test_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
+            encoded_test_dataset = encoded_test_dataset[:len(encoded_test_dataset)]
 
 concept_set = CFG.concepts_from_labels[args.dataset]
 print("concept len: ", len(concept_set))
@@ -151,6 +167,8 @@ print("creating loader...")
 train_loader = build_loaders(encoded_train_dataset, mode="train")
 if args.dataset in ['SetFit/sst2', 'custom_echr']:
     val_loader = build_loaders(encoded_val_dataset, mode="valid")
+    if args.dataset == 'custom_echr':
+        test_loader = build_loaders(encoded_test_dataset, mode="valid")
 
 print("preparing backbone")
 # Use the fine-tuned Llama3 model from experiment_00015
@@ -507,3 +525,75 @@ for epoch in range(CFG.epoch[args.dataset]):
             print(f"All model components successfully saved for epoch {epoch} with loss {best_loss:.6f}")
     else:
         print(f"Warning: Training loss is NaN/Inf ({avg_training_concept_loss}), skipping model save")
+
+# Calculate perplexity on ECHR test dataset after training
+if args.dataset == 'custom_echr':
+    print("\n" + "="*80)
+    print("Calculating perplexity on ECHR test dataset...")
+    print("="*80)
+    
+    preLM.eval()
+    cbl.eval()
+    
+    all_log_probs = []
+    total_tokens = 0
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(test_loader):
+            try:
+                input_ids = batch[0].to(preLM_device)
+                attention_mask = batch[1].to(preLM_device)
+                concept_label = batch[2]
+                word_label = batch[3].to(preLM_device)
+                
+                # Forward pass through preLM
+                features = preLM(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+                last_hidden = features.hidden_states[-1]
+                
+                # Pool features for CBL
+                features_for_cbl = mean_pooling(last_hidden, attention_mask)
+                
+                # Move to CBL device if needed
+                if use_multi_gpu and torch.cuda.device_count() >= 2:
+                    features_for_cbl = features_for_cbl.to(cbl_device)
+                
+                # Forward through CBL
+                concepts, unsup, vocabs = cbl(features_for_cbl.float())
+                
+                # Calculate perplexity
+                shift_logits = vocabs[:, :-1, :].contiguous()
+                shift_labels = word_label[:, 1:].contiguous()
+                
+                shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+                shift_labels = shift_labels.view(-1)
+                
+                # Filter out padding tokens
+                mask = shift_labels != tokenizer.pad_token_id
+                if mask.sum() > 0:
+                    filtered_logits = shift_logits[mask]
+                    filtered_labels = shift_labels[mask]
+                    
+                    log_probs = F.log_softmax(filtered_logits, dim=-1)
+                    token_log_probs = log_probs.gather(1, filtered_labels.unsqueeze(1)).squeeze(1)
+                    
+                    all_log_probs.extend(token_log_probs.cpu().numpy().tolist())
+                    total_tokens += len(token_log_probs)
+                
+                # Progress indicator
+                if (batch_idx + 1) % 10 == 0:
+                    print(f"Processed {batch_idx + 1}/{len(test_loader)} batches")
+                    
+            except Exception as e:
+                print(f"Error processing batch {batch_idx}: {e}")
+                continue
+    
+    # Calculate final perplexity
+    if all_log_probs:
+        avg_log_prob = np.mean(all_log_probs)
+        perplexity = np.exp(-avg_log_prob)
+        print("\n" + "="*80)
+        print(f"Test Perplexity: {perplexity:.4f}")
+        print(f"Total tokens evaluated: {total_tokens}")
+        print("="*80)
+    else:
+        print("Warning: No valid predictions for perplexity calculation")

@@ -37,7 +37,7 @@ echo "Printing versions for debugging"
 python -c "import sys; import torch; import transformers; print('Python:', sys.version.split()[0]); print('PyTorch:', getattr(torch,'__version__', 'n/a')); print('Transformers:', getattr(transformers,'__version__','n/a'))"
 
 echo "Running Stage-2 latent evaluation script"
-python evaluate_latents.py \
+python probe.py \
   --stage1_ckpt ~/CB-LLMs/disentangling/models/vib/4096_1/custom_echr/llama3/ \
   --stage2_ckpt ~/CB-LLMs/disentangling/models/vib/norm_2/custom_echr_custom_echr/llama3/ \
   --layer_s1 all \

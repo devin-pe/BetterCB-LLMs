@@ -58,8 +58,12 @@ def collate_fn(batch):
 
 
 def find_checkpoint(root):
+    """Find a checkpoint file in the given directory (with glob fallback)"""
     paths = glob.glob(os.path.join(root, '**', 'model*.pth'), recursive=True)
-    return paths[0] if paths else None
+    if paths:
+        # Return the first .pth file found, not directory
+        return paths[0]
+    return None
 
 
 def main():
@@ -71,6 +75,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--max_length', type=int, default=512)
     parser.add_argument('--no_cuda', action='store_true')
+    parser.add_argument('--layer_s1', type=str, default='all', help='Stage 1 layer: "all" or layer index')
+    parser.add_argument('--layer_s2', type=str, default='all', help='Stage 2 layer: "all" or layer index')
     args = parser.parse_args()
 
     device = torch.device('cpu') if args.no_cuda or not torch.cuda.is_available() else torch.device('cuda:0')
@@ -84,21 +90,50 @@ def main():
     base_model.to(device)
     base_model.eval()
   
-    stage1_ckpt = args.stage1_ckpt or find_checkpoint(root='./models/vib/1')
+    # Load Stage-1 checkpoint
+    stage1_ckpt = args.stage1_ckpt
+    if stage1_ckpt is None:
+        stage1_ckpt = find_checkpoint(root='./models/vib/1')
     if stage1_ckpt is None:
         raise RuntimeError('No Stage-1 checkpoint found (pass --stage1_ckpt)')
-    stage2_ckpt = args.stage2_ckpt or find_checkpoint(root='./models/vib/0.01_2')
-    if stage2_ckpt is None:
-        raise RuntimeError('No Stage-2 checkpoint found (pass --stage2_ckpt)')
-      
+    
+    # If stage1_ckpt is a directory, find the model file inside it
+    if os.path.isdir(stage1_ckpt):
+        print(f'Stage-1 checkpoint is a directory: {stage1_ckpt}, searching for model files...')
+        model_files = glob.glob(os.path.join(stage1_ckpt, 'model*.pth'))
+        if not model_files:
+            raise FileNotFoundError(f'No model*.pth files found in {stage1_ckpt}')
+        stage1_ckpt = model_files[0]
+        print(f'Found Stage-1 model file: {stage1_ckpt}')
+    
     print(f'Loading Stage-1 checkpoint: {stage1_ckpt}')
+    if not os.path.exists(stage1_ckpt):
+        raise FileNotFoundError(f'Stage-1 checkpoint file not found: {stage1_ckpt}')
     stage1_checkpoint = torch.load(stage1_ckpt, map_location=device)
     stage1_latent_dim = stage1_checkpoint['encoder.mu.weight'].shape[0]
     stage1_has_layer_weights = 'layer_weights' in stage1_checkpoint
     print(f'Inferred Stage-1 latent dim: {stage1_latent_dim}')
     print(f'Stage-1 layer_weight_averaging: {stage1_has_layer_weights}')
     
+    # Load Stage-2 checkpoint
+    stage2_ckpt = args.stage2_ckpt
+    if stage2_ckpt is None:
+        stage2_ckpt = find_checkpoint(root='./models/vib/linear_comb2')
+    if stage2_ckpt is None:
+        raise RuntimeError('No Stage-2 checkpoint found (pass --stage2_ckpt)')
+    
+    # If stage2_ckpt is a directory, find the model file inside it
+    if os.path.isdir(stage2_ckpt):
+        print(f'Stage-2 checkpoint is a directory: {stage2_ckpt}, searching for model files...')
+        model_files = glob.glob(os.path.join(stage2_ckpt, 'model*.pth'))
+        if not model_files:
+            raise FileNotFoundError(f'No model*.pth files found in {stage2_ckpt}')
+        stage2_ckpt = model_files[0]
+        print(f'Found Stage-2 model file: {stage2_ckpt}')
+    
     print(f'Loading Stage-2 checkpoint: {stage2_ckpt}')
+    if not os.path.exists(stage2_ckpt):
+        raise FileNotFoundError(f'Stage-2 checkpoint file not found: {stage2_ckpt}')
     stage2_checkpoint = torch.load(stage2_ckpt, map_location=device)
     stage2_latent_dim = stage2_checkpoint['encoder.mu.weight'].shape[0]
     stage2_has_layer_weights = 'layer_weights' in stage2_checkpoint
@@ -175,8 +210,13 @@ def main():
             outputs = base_model(batch['input_ids'], attention_mask=batch['attention_mask'], output_hidden_states=True, return_dict=True)
             hidden_states = torch.stack(outputs.hidden_states)[1:].permute(1, 0, 2, 3)
             
+            hidden_states = hidden_states.float()
+            
             # Extract Stage-1 latents
-            h1 = hidden_states
+            # Select layers based on layer_s1 argument
+            if args.layer_s1 == 'all':
+                h1 = hidden_states
+            
             if stage1_config.layer_weight_averaging:
                 w1 = torch.nn.functional.softmax(stage1_vib.layer_weights, dim=0)
                 h1 = torch.sum(h1 * w1.view(1, w1.shape[0], 1, 1), dim=1)
@@ -187,7 +227,13 @@ def main():
             logits_s1 = decoder_outputs_s1[0]
             
             # Extract Stage-2 latents
-            h2 = hidden_states
+            # Select layers based on layer_s2 argument
+            if args.layer_s2 == 'all':
+                h2 = hidden_states
+            else:
+                layer_idx = int(args.layer_s2)
+                h2 = hidden_states[:, layer_idx:layer_idx+1, :, :]
+            
             if stage2_config.layer_weight_averaging:
                 w2 = torch.nn.functional.softmax(stage2_vib.layer_weights, dim=0)
                 h2 = torch.sum(h2 * w2.view(1, w2.shape[0], 1, 1), dim=1)

@@ -21,6 +21,42 @@ from modules import VIB, VIBConfig
 from dataset_utils import load_echr_data, prepare_dataset_stage2, create_collate_fn
 
 
+class GradientReversalFunction(torch.autograd.Function):
+    """Gradient Reversal Layer from 'Domain-Adversarial Training of Neural Networks' (Ganin et al.)
+    
+    Forward pass: identity function
+    Backward pass: negates gradients (multiplies by -lambda)
+    This makes the encoder learn features that FOOL the classifier (adversarial)
+    """
+    @staticmethod
+    def forward(ctx, x, lambda_):
+        ctx.lambda_ = lambda_
+        return x.view_as(x)
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.lambda_, None
+
+
+class GradientReversalLayer(torch.nn.Module):
+    def __init__(self, lambda_=1.0):
+        super().__init__()
+        self.lambda_ = lambda_
+    
+    def forward(self, x):
+        return GradientReversalFunction.apply(x, self.lambda_)
+
+
+def extract_has_person_labels(position_strings):
+    """Extract binary has_person labels from position strings"""
+    labels = []
+    for pos_str in position_strings:
+        pos_list = [int(x) for x in pos_str.split(',')]
+        has_person = 1 if any(pos_list) else 0
+        labels.append(has_person)
+    return torch.tensor(labels, dtype=torch.long)
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--DATA_S1", type=str, default="custom_echr")
@@ -32,17 +68,11 @@ def parse_args():
     parser.add_argument("--LEARNING_RATE", type=float, default=1e-4)
     parser.add_argument("--BETA_S1", type=float, default=0.1)
     parser.add_argument("--BETA_S2", type=float, default=0.0)
-    parser.add_argument("--BETA_S2_MSE", type=float, default=2.5)
+    parser.add_argument("--GAMMA", type=float, default=2.5)
     parser.add_argument("--var_clamp_min", type=float, default=0.1,
                         help='Minimum variance clamp value used in the encoder (default: 0.1)')
     parser.add_argument("--var_clamp_max", type=float, default=10.0,
                         help='Maximum variance clamp value used in the encoder (default: 10.0)')
-    parser.add_argument("--beta_s2_start", type=float, default=None,
-                        help='Starting beta_s2 for annealing (default: use BETA_S2)')
-    parser.add_argument("--beta_s2_end", type=float, default=None,
-                        help='Ending beta_s2 for annealing (default: use BETA_S2)')
-    parser.add_argument("--beta_s2_warmup_epochs", type=int, default=0,
-                        help='Number of epochs to linearly anneal beta_s2 from start to end (0=no annealing)')
     parser.add_argument("--SEED", type=int, default=42)
     parser.add_argument("--NO_IB", action='store_true')
     parser.add_argument("--MAX_LENGTH", type=int, default=512)
@@ -67,8 +97,8 @@ def main():
     DATA_PATH = "/home/dpereira/CB-LLMs/generation/dataset/"
     LOAD_STAGE1_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/models/vib/4096_1/{args.DATA_S1}/{args.MODEL_NAME}/"
     DATA_ = args.DATA_S1 + "_" + args.DATA_S2
-    SAVE_REPORTS_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/reports/vib/0.05_2/{DATA_}/{args.MODEL_NAME}/"
-    SAVE_MODEL_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/models/vib/0.05_2/{DATA_}/{args.MODEL_NAME}/"
+    SAVE_REPORTS_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/reports/vib/adv_2/{DATA_}/{args.MODEL_NAME}/"
+    SAVE_MODEL_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/models/vib/adv_2/{DATA_}/{args.MODEL_NAME}/"
     
     print(f"Model will be saved at {SAVE_MODEL_PATH}")
     
@@ -98,6 +128,12 @@ def main():
     )
     base_model.to(device)
     base_model.eval()
+    
+    # # Extract RMSNorm from LLaMA3 for normalizing merged_latents
+    # # Using the final layer norm from the base model ensures proper scale
+    # llama3_norm = base_model.norm  # LLaMA's final RMSNorm layer
+    # llama3_norm.eval()  # Keep frozen during training
+    # print(f"Extracted RMSNorm from LLaMA3 base model (will be applied after merging)")
     
     # Enable gradient checkpointing for memory efficiency
     if hasattr(base_model, 'gradient_checkpointing_enable'):
@@ -172,10 +208,19 @@ def main():
     model.to(device)
     model.train()
     
+    # Add Gradient Reversal Layer + classifier for adversarial training
+    # GRL reverses gradients during backprop, so encoder learns to FOOL the classifier
+    # Classifier learns to DETECT has_person from Stage 2 mu
+    gradient_reversal = GradientReversalLayer(lambda_=1.0).to(device)
+    adversarial_classifier = torch.nn.Linear(LATENT_DIM, 2).to(device)
+    adversarial_classifier.train()
+    print(f"Initialized Gradient Reversal Layer with lambda=1.0")
+    
     # Load data
     print("Loading datasets...")
-    train_data = load_echr_data('train', stage="2", data_path=DATA_PATH)
-    test_data = load_echr_data('test', stage="2", data_path=DATA_PATH)
+    # Load with stage="1" to get position labels for has_person extraction
+    train_data = load_echr_data('train', stage="1", data_path=DATA_PATH)
+    test_data = load_echr_data('test', stage="1", data_path=DATA_PATH)
     
     # Prepare datasets
     print("[DEBUG] About to map train_data...")
@@ -223,16 +268,17 @@ def main():
     
     # Print run configuration
     print("\n" + "="*80)
-    print("STAGE 2 TRAINING CONFIGURATION")
+    print("STAGE 2 TRAINING CONFIGURATION (with Gradient Reversal Layer)")
     print("="*80)
     print(f"Total Epochs: {args.EPOCHS}")
     print(f"Batch Size: {args.BATCH_SIZE}")
     print(f"Learning Rate: {args.LEARNING_RATE}")
     print(f"Stage 1 Latent Dimension: {stage1_latent_dim}")
     print(f"Stage 2 Latent Dimension: {LATENT_DIM}")
-    print(f"Beta (Info Loss): {args.BETA_S2}")
-    print(f"Beta MSE: {args.BETA_S2_MSE}")
+    print(f"Beta S2 (GRL Adversarial): {args.BETA_S2}")
+    print(f"Gamma (MSE weight): {args.GAMMA}")
     print(f"Layer S1: {args.LAYER_S1}, Layer S2: {args.LAYER_S2}")
+    print(f"Adversarial Method: Gradient Reversal Layer (Ganin et al.)")
     print(f"Model save location: {SAVE_MODEL_PATH}")
     print("="*80 + "\n")
     
@@ -242,7 +288,9 @@ def main():
     print("[DEBUG] Metric loaded successfully")
     
     print("[DEBUG] Creating optimizer...")
-    optimizer = AdamW(params=model.parameters(), lr=args.LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    # Include both VIB and adversarial classifier parameters (GRL has no parameters)
+    all_params = list(model.parameters()) + list(adversarial_classifier.parameters())
+    optimizer = AdamW(params=all_params, lr=args.LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     print("[DEBUG] Optimizer created successfully")
     
     print("[DEBUG] Creating learning rate scheduler...")
@@ -253,18 +301,10 @@ def main():
     )
     print("[DEBUG] LR scheduler created successfully")
     
-    # Setup beta_s2 annealing
-    beta_s2_start = args.beta_s2_start if args.beta_s2_start is not None else args.BETA_S2
-    beta_s2_end = args.beta_s2_end if args.beta_s2_end is not None else args.BETA_S2
-    beta_s2_warmup_epochs = args.beta_s2_warmup_epochs
-    
-    if beta_s2_warmup_epochs > 0:
-        print(f"[INFO] Beta_S2 annealing enabled: {beta_s2_start:.6f} -> {beta_s2_end:.6f} over {beta_s2_warmup_epochs} epochs")
-    else:
-        print(f"[INFO] Beta_S2 fixed at {args.BETA_S2}")
-    
-    beta_mse = float(args.BETA_S2_MSE)
-    print(f"[DEBUG] Beta MSE set: beta_mse={beta_mse}")
+    beta_s2 = float(args.BETA_S2)
+    beta_mse = float(args.GAMMA)
+    print(f"[INFO] Beta S2 (adversarial loss): {beta_s2}")
+    print(f"[DEBUG] Gamma (MSE weight): beta_mse={beta_mse}")
     
     # Training loop
     train_losses = {'Task': [], 'Info': [], 'MSE': [], 'Total': []}
@@ -281,20 +321,10 @@ def main():
     for epoch in range(args.EPOCHS):
         print(f"\n[DEBUG] ========== Starting Epoch {epoch+1}/{args.EPOCHS} ===========")
         
-        # Compute annealed beta_s2 for current epoch
-        if beta_s2_warmup_epochs > 0 and epoch < beta_s2_warmup_epochs:
-            # Linear warmup from beta_s2_start to beta_s2_end
-            progress = epoch / beta_s2_warmup_epochs
-            beta = beta_s2_start + progress * (beta_s2_end - beta_s2_start)
-        else:
-            # After warmup, use final value
-            beta = beta_s2_end
-        
-        print(f"[INFO] Epoch {epoch+1}: beta_s2 = {beta:.6f}")
-        
         model.train()
+        adversarial_classifier.train()
         epoch_task_loss = 0
-        epoch_info_loss = 0
+        epoch_adv_loss = 0
         epoch_mse_loss = 0
         epoch_total_loss = 0
         
@@ -330,7 +360,7 @@ def main():
             # Transform to batch-first and skip embedding layer
             hidden_states = hidden_states[1:].permute(1, 0, 2, 3)  # (batch, layers, seq, hidden)
             
-            # Store last hidden state for MSE loss computation (reuse from this forward pass)
+            # Store layer 31 (pre-RMSNorm) for MSE loss computation - matches decoder's output space
             llama3_last_hidden = outputs.hidden_states[-1].float()
             
             hidden_states = hidden_states.float()
@@ -347,6 +377,9 @@ def main():
                     noise=False 
                 )
             
+            # Extract has_person labels from position strings
+            has_person_labels = extract_has_person_labels(batch['position']).to(device)
+            
             # Forward Stage 2 VIB model
             outputs_vib = model(
                 hidden_states if layer_s2 == "all" else hidden_states[:, layer_s2:layer_s2+1],
@@ -356,13 +389,33 @@ def main():
             )
             logits, merged_latents, mu, var = outputs_vib
             
+            # # Apply RMSNorm to merged_latents before decoding (matches LLaMA3's output normalization)
+            # # Note: MSE will use pre-norm merged_latents, but decoder gets normalized version
+            # with torch.no_grad():
+            #     merged_latents_normalized = llama3_norm(merged_latents)
             
-            info_loss = -0.5 * torch.sum(1 + torch.log(var) - mu.pow(2) - var, dim=-1)
-            info_loss = torch.masked_select(info_loss, batch["attention_mask"].bool()).mean()
+            # Adversarial loss with Gradient Reversal Layer
+            # Pool mu across sequence dimension (mean pooling over valid tokens)
+            attention_mask_expanded = batch["attention_mask"].unsqueeze(-1).float()
+            pooled_mu = (mu * attention_mask_expanded).sum(dim=1) / attention_mask_expanded.sum(dim=1).clamp(min=1.0)
             
-            # Compute MSE regression to LLaMA3's last hidden layer
+            # Pass through GRL: forward = identity, backward = gradient reversal
+            # This makes encoder learn to FOOL classifier while classifier learns to DETECT PII
+            pooled_mu_reversed = gradient_reversal(pooled_mu)
+            adv_logits = adversarial_classifier(pooled_mu_reversed)
+            
+            # Standard cross-entropy loss: classifier tries to predict has_person correctly
+            # Encoder (via reversed gradients) tries to maximize this loss = fool classifier
+            adv_loss = F.cross_entropy(adv_logits, has_person_labels)
+            
+            # Compute MSE regression to LLaMA3's layer 31 (pre-RMSNorm)
+            # We compare pre-norm merged_latents to pre-norm layer 31 output
             mse_loss = F.mse_loss(merged_latents, llama3_last_hidden, reduction='none').mean(dim=-1)
             mse_loss = torch.masked_select(mse_loss, batch["attention_mask"].bool()).mean()
+            
+            # # Now recompute logits with normalized merged_latents
+            # # Decoder expects RMSNorm-normalized representations
+            # logits = model.decoder.lm_head(merged_latents_normalized)
             
             # Compute language modeling loss
             shift_logits = logits[:, :-1, :].contiguous()  # [batch, seq_len-1, vocab_size]
@@ -376,16 +429,16 @@ def main():
             # Ignore padding tokens (pad_token_id is already mapped to -100 in collate_fn)
             task_loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
             
-            # Total loss
-            total_loss = task_loss + beta * info_loss + beta_mse * mse_loss
+            # Total loss: task + adversarial (encourages PII independence) + MSE (representation quality)
+            total_loss = task_loss + beta_s2 * adv_loss + beta_mse * mse_loss
             
             # Check for NaN
             if torch.isnan(total_loss).any():
                 print(f"ERROR: NaN detected in total_loss at epoch {epoch+1}, step {step}")
                 print(f"  task_loss: {task_loss.item():.4f}")
-                print(f"  info_loss: {info_loss.item() if not torch.isnan(info_loss) else 'NaN'}")
+                print(f"  adv_loss (GRL): {adv_loss.item() if not torch.isnan(adv_loss) else 'NaN'}")
                 print(f"  mse_loss: {mse_loss.item():.4f}")
-                print(f"  beta: {beta}, beta_mse: {beta_mse}")
+                print(f"  beta_s2: {beta_s2}, beta_mse: {beta_mse}")
                 print(f"  mu stats - min: {mu.min().item():.6e}, max: {mu.max().item():.6e}, mean: {mu.mean().item():.6e}")
                 print(f"  var stats - min: {var.min().item():.6e}, max: {var.max().item():.6e}, mean: {var.mean().item():.6e}")
                 print("  Stopping training to prevent NaN propagation.")
@@ -395,10 +448,10 @@ def main():
             if total_loss.item() > 1e4:
                 print(f"WARNING: Extremely large loss at epoch {epoch+1}, step {step}: {total_loss.item():.4f}")
                 print(f"  task_loss: {task_loss.item():.4f}")
-                print(f"  info_loss: {info_loss.item():.4f}")
+                print(f"  adv_loss: {adv_loss.item():.4f}")
                 print(f"  mse_loss: {mse_loss.item():.4f}")
-                print(f"  beta: {beta}, beta_mse: {beta_mse}")
-                print(f"  Breakdown: task={task_loss.item():.4f} + beta*info={beta}*{info_loss.item():.4f} + beta_mse*mse={beta_mse}*{mse_loss.item():.4f}")
+                print(f"  beta_s2: {beta_s2}, beta_mse: {beta_mse}")
+                print(f"  Breakdown: task={task_loss.item():.4f} + beta_s2*adv={beta_s2}*{adv_loss.item():.4f} + beta_mse*mse={beta_mse}*{mse_loss.item():.4f}")
                 print(f"  mu stats - min: {mu.min().item():.6e}, max: {mu.max().item():.6e}, mean: {mu.mean().item():.6e}")
                 print(f"  var stats - min: {var.min().item():.6e}, max: {var.max().item():.6e}, mean: {var.mean().item():.6e}")
             
@@ -411,18 +464,18 @@ def main():
             
             # Track losses
             epoch_task_loss += task_loss.item()
-            epoch_info_loss += info_loss.item()
+            epoch_adv_loss += adv_loss.item()
             epoch_mse_loss += mse_loss.item()
             epoch_total_loss += total_loss.item()
         
         # Compute average losses
         avg_total_loss = epoch_total_loss / len(train_dataloader)
         avg_task_loss = epoch_task_loss / len(train_dataloader)
-        avg_info_loss = epoch_info_loss / len(train_dataloader)
+        avg_adv_loss = epoch_adv_loss / len(train_dataloader)
         avg_mse_loss = epoch_mse_loss / len(train_dataloader)
         
         train_losses['Task'].append(avg_task_loss)
-        train_losses['Info'].append(avg_info_loss)
+        train_losses['Info'].append(avg_adv_loss)  # Reuse 'Info' key for adversarial loss
         train_losses['MSE'].append(avg_mse_loss)
         train_losses['Total'].append(avg_total_loss)
         
@@ -431,11 +484,11 @@ def main():
             best_total_loss = avg_total_loss
             best_model_state = {k: v.clone().cpu() for k, v in model.state_dict().items()}
             print(f"Epoch {epoch+1}/{args.EPOCHS}, Task Loss: {avg_task_loss:.4f}, "
-                  f"Info Loss: {avg_info_loss:.4f}, MSE Loss: {avg_mse_loss:.4f}, "
+                  f"Adv Loss (GRL): {avg_adv_loss:.4f}, MSE Loss: {avg_mse_loss:.4f}, "
                   f"Total Loss: {avg_total_loss:.4f} -> New best!")
         else:
             print(f"Epoch {epoch+1}/{args.EPOCHS}, Task Loss: {avg_task_loss:.4f}, "
-                  f"Info Loss: {avg_info_loss:.4f}, MSE Loss: {avg_mse_loss:.4f}, "
+                  f"Adv Loss (GRL): {avg_adv_loss:.4f}, MSE Loss: {avg_mse_loss:.4f}, "
                   f"Total Loss: {avg_total_loss:.4f}")
         
         # Evaluation
@@ -473,8 +526,13 @@ def main():
                         m=batch["attention_mask"], 
                         cond=mu1
                     )
-                
-                logits = outputs_vib[0]
+                    
+                    # # Apply RMSNorm to merged_latents before decoding (same as training)
+                    # _, merged_latents, _, _ = outputs_vib
+                    # merged_latents_normalized = llama3_norm(merged_latents)
+                    # logits = model.decoder.lm_head(merged_latents_normalized)
+                    
+                    logits = outputs_vib[0]
                 
                 # Compute perplexity
                 shift_logits = logits[..., :-1, :].contiguous()
@@ -540,9 +598,24 @@ def main():
     
     # Output final alpha value from the decoder
     if hasattr(model, 'decoder') and hasattr(model.decoder, 'alpha'):
-        final_alpha = model.decoder.alpha.item()
-        print(f"\nFinal alpha value (Stage 2 weight): {final_alpha:.6f}")
-        print(f"Final Stage 1 weight: {1 - final_alpha:.6f}")
+        alpha_tensor = model.decoder.alpha.detach().cpu()
+        if alpha_tensor.numel() == 1:
+            # Scalar alpha
+            final_alpha = alpha_tensor.item()
+            print(f"\nFinal alpha value (Stage 2 weight): {final_alpha:.6f}")
+            print(f"Final Stage 1 weight: {1 - final_alpha:.6f}")
+        else:
+            # Multi-element alpha (e.g., per-token or per-layer)
+            print(f"\nAlpha statistics (Stage 2 weight):")
+            print(f"  Min: {alpha_tensor.min().item():.6f}")
+            print(f"  Max: {alpha_tensor.max().item():.6f}")
+            print(f"  Mean: {alpha_tensor.mean().item():.6f}")
+            print(f"  Std: {alpha_tensor.std().item():.6f}")
+            print(f"\nStage 1 weight statistics:")
+            one_minus_alpha = 1.0 - alpha_tensor
+            print(f"  Min: {one_minus_alpha.min().item():.6f}")
+            print(f"  Max: {one_minus_alpha.max().item():.6f}")
+            print(f"  Mean: {one_minus_alpha.mean().item():.6f}")
     
     print(f"\nStage 2 training completed!")
     print(f"Best model saved with Total Loss: {best_total_loss:.4f}")

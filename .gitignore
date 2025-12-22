@@ -1,4 +1,7 @@
 generation/dataset
+generation/from_pretained_llama3_lora_cbm
+generation/models
+generation/work
 analysing_pii_leakage/examples/experiments
 analysing_pii_leakage/work
 disentangling/work

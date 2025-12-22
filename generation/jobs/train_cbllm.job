@@ -1,11 +1,11 @@
 #!/bin/bash
 
-#SBATCH --partition=gpu_h100          # Partition name
-#SBATCH --gres=gpu:3                  # Number of GPUs to allocate
-#SBATCH --job-name=train_cbllm_has_person   # Job name
+#SBATCH --partition=gpu_a100          # Partition name
+#SBATCH --gres=gpu:1                  # Number of GPUs to allocate
+#SBATCH --job-name=train_cbllm_gen   # Job name
 #SBATCH --ntasks=1                    # Number of tasks
-#SBATCH --time=8:00:00               # Time limit hh:mm:ss
-#SBATCH --output=/home/dpereira/CB-LLMs/analysing_pii_leakage/work/train_cbllm_has_person_%A.out      # Standard output (%A expands to job ID)
+#SBATCH --time=12:00:00               # Time limit hh:mm:ss
+#SBATCH --output=/home/dpereira/CB-LLMs/generation/work/train_cbllm_%A.out      # Standard output (%A expands to job ID)
 
 ### --- MODULE SETUP / ENVIRONMENT ---
 module purge
@@ -15,7 +15,7 @@ module load 2023
 source ~/.bashrc 2>/dev/null || true
 conda activate pii-leakage 2>/dev/null || echo "Using system Python environment"
 
-# Memory optimization environment variables for multi-GPU (matching fine-tuning script)
+# Memory optimization environment variables for multi-GPU
 export NUMPY_EXPERIMENTAL_ARRAY_FUNCTION=0
 export CUDA_LAUNCH_BLOCKING=1
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64,garbage_collection_threshold:0.8
@@ -54,26 +54,15 @@ python -c "import peft; print(f'PEFT version: {peft.__version__}')"
 # Debug CUDA setup
 python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}')"
 
-### --- TRAIN CB-LLM MODEL WITH HAS_PERSON LABELS - 2 GPU VERSION ---
-echo "Starting CB-LLM training with ECHR dataset and has_person binary classification (2 GPU version)..."
-echo "Using fine-tuned Llama3 base model from experiment_00015..."
 
-# Train CB-LLM with has_person binary classification using fine-tuned Llama3
-# With 3 GPUs we have 120GB total memory - should be plenty for CB-LLM components
-python train_CBLLM_multi_gpu.py \
-    --dataset custom_echr \
-    --batch_size 2 \
-    --max_length 300 \
-    --gradient_accumulation_steps 4 \
-    --num_workers 0 
+python train_CBLLM.py 
+
 echo "CB-LLM training completed!"
 
 ### --- TRAINING SUMMARY ---
 echo "Training Summary:"
-echo "- Dataset: Custom ECHR with has_person labels"
-echo "- Base Model: Fine-tuned Llama3 from experiment_00015"
-echo "- Task: Binary classification (has_person: 0/1)"
-echo "- Concepts: PII name detection concepts"
+echo "- Dataset: SetFit/sst2
+echo "- Base Model: Pretrained Llama3"
 echo "- Model saved to: ./models/from_pretained_llama3_lora_cbm/custom_echr/"
 
 # List generated model files

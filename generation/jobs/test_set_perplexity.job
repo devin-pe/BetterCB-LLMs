@@ -4,10 +4,10 @@
 #SBATCH --gres=gpu:1                  # Number of GPUs to allocate
 #SBATCH --cpus-per-task=12            # Number of CPU cores per task
 #SBATCH --gpus=1                      # This line is sometimes optional/redundant depending on your system
-#SBATCH --job-name=ppl_vib            # Job name (customize)
+#SBATCH --job-name=test_set_ppl_llama3    # Job name (customize)
 #SBATCH --ntasks=1                    # Number of tasks
-#SBATCH --time=12:00:00               # Time limit hh:mm:ss
-#SBATCH --output=/home/dpereira/CB-LLMs/disentangling/work/perplexity_%A.out  # Standard output (%A expands to job ID)
+#SBATCH --time=4:00:00               # Time limit hh:mm:ss
+#SBATCH --output=/home/dpereira/CB-LLMs/generation/work/test_set_perplexity_%A.out      # Standard output (%A expands to job ID)
 
 ### --- MODULE SETUP / ENVIRONMENT ---
 module purge
@@ -33,15 +33,10 @@ python -c "from transformers import AutoTokenizer; print('Testing Llama3 access.
 pip install datasets
 
 ### --- RUN ---
-cd "$REPO_ROOT/disentangling"
+cd "$REPO_ROOT/generation"
 
-python perplexity.py \
-    --model_path /home/dpereira/CB-LLMs/disentangling/models/vib/norm_2/custom_echr_custom_echr/llama3/ \
-    --base_model_path /home/dpereira/CB-LLMs/analysing_pii_leakage/examples/experiments/experiment_00015 \
-    --stage 2 \
-    --layer_s1 all \
-    --layer_s2 30 \
-    --stride 1024 \
-    --stage1_model_path ~/CB-LLMs/disentangling/models/vib/4096_1/custom_echr/llama3/ \
+echo "Starting perplexity evaluation..."
+
+python test_set_perplexity.py --model_path models/4096/custom_echr
 
 echo "Perplexity evaluation completed!"

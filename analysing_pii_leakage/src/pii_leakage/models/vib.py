@@ -168,6 +168,8 @@ class VIBWrapper(LanguageModel):
         if verbose:
             print(f"> Stage 2 latent_dim: {latent_dim}")
             print(f"> Layer weight averaging: {layer_weight_averaging}")
+            if cond_dim == latent_dim:
+                print(f"> Note: Stage 1 and Stage 2 have same latent dimension ({latent_dim})")
 
         # Create Stage 2 VIB config
         vib_config = VIBConfig(
@@ -191,8 +193,8 @@ class VIBWrapper(LanguageModel):
         # Load Stage 1 VIB model for conditioning
         stage1_model_path = getattr(self.model_args, 'stage1_model_path', None)
         if stage1_model_path is None:
-            # Default path based on Stage 2 path
-            stage1_model_path = os.path.join(project_root, 'disentangling/models/vib/1/custom_echr/llama3')
+            # Default path based on new checkpoint structure (4096_1 for same-size latents)
+            stage1_model_path = os.path.join(project_root, 'disentangling/models/vib/4096_1/custom_echr/llama3')
         
         stage1_model_path = os.path.expanduser(stage1_model_path)
 

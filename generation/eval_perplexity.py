@@ -222,8 +222,16 @@ def detect_model_type(model_path):
 
 def main():
     parser = argparse.ArgumentParser(description='Evaluate perplexity for CBLLM or regular fine-tuned models')
-    parser.add_argument('--model_path', type=str, required=True, 
-                       help='Path to the model checkpoint (CBLLM or regular fine-tuned)')
+    parser.add_argument('--model_path', type=str, default=None,
+                       help='Path to unified model directory (CBLLM with cbl_epoch_2.pt or regular fine-tuned)')
+    parser.add_argument('--base_model_path', type=str, default=None,
+                       help='Path to base model (for separate model/CBL structure from train_CBLLM.py)')
+    parser.add_argument('--cbl_checkpoint', type=str, default=None,
+                       help='Path to CBL checkpoint file (use with --base_model_path, e.g., cbl_epoch_1.pt)')
+    parser.add_argument('--unsup_dim', type=int, default=None,
+                       help='Unsupervised dimension for CBL (if different from config default)')
+    parser.add_argument('--concept_set', type=str, default='custom_echr',
+                       help='Concept set name from config.py (e.g., custom_echr, SetFit_sst2)')
     parser.add_argument('--model_type', type=str, choices=['auto', 'cbllm', 'regular'], default='auto',
                        help='Type of model: auto (detect automatically), cbllm, or regular')
     parser.add_argument('--intervention', type=str, default='none',
@@ -243,13 +251,29 @@ def main():
         device = torch.device(args.device)
     
     logger.info(f"Using device: {device}")
-    logger.info(f"Loading model from: {args.model_path}")
     
-    # Detect model type if auto
-    if args.model_type == 'auto':
-        detected_type = detect_model_type(args.model_path)
-        logger.info(f"Auto-detected model type: {detected_type}")
-        args.model_type = detected_type
+    # Validate argument combinations
+    if args.base_model_path or args.cbl_checkpoint:
+        # Separate paths mode
+        if not (args.base_model_path and args.cbl_checkpoint):
+            logger.error("Both --base_model_path and --cbl_checkpoint must be provided together")
+            sys.exit(1)
+        if args.model_path:
+            logger.warning("--model_path is ignored when --base_model_path and --cbl_checkpoint are provided")
+        logger.info(f"Loading model from: {args.base_model_path}")
+        logger.info(f"Loading CBL from: {args.cbl_checkpoint}")
+        args.model_type = 'cbllm'  # Force CBLLM type when separate paths provided
+    elif args.model_path:
+        # Unified directory mode
+        logger.info(f"Loading model from: {args.model_path}")
+        # Detect model type if auto
+        if args.model_type == 'auto':
+            detected_type = detect_model_type(args.model_path)
+            logger.info(f"Auto-detected model type: {detected_type}")
+            args.model_type = detected_type
+    else:
+        logger.error("Must provide either --model_path OR (--base_model_path + --cbl_checkpoint)")
+        sys.exit(1)
     
     logger.info(f"Model type: {args.model_type}")
     
@@ -316,8 +340,21 @@ def load_wikitext103_texts():
 def evaluate_cbllm_model(args, device, texts):
     """Evaluate CBLLM model perplexity."""
     try:
-        config = LlamaConfig.from_pretrained(args.model_path)
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+        # Determine paths for base model and CBL checkpoint
+        if args.base_model_path and args.cbl_checkpoint:
+            # Separate paths provided (train_CBLLM.py output structure)
+            base_path = args.base_model_path
+            cbl_path = args.cbl_checkpoint
+            logger.info(f"Using separate base model path: {base_path}")
+            logger.info(f"Using separate CBL checkpoint: {cbl_path}")
+        else:
+            # Unified directory (original structure)
+            base_path = args.model_path
+            cbl_path = os.path.join(args.model_path, "cbl_epoch_2.pt")
+            logger.info(f"Using unified model directory: {args.model_path}")
+        
+        config = LlamaConfig.from_pretrained(base_path)
+        tokenizer = AutoTokenizer.from_pretrained(base_path)
         # Configure tokenizer
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -328,30 +365,32 @@ def evaluate_cbllm_model(args, device, texts):
         warnings.filterwarnings("ignore", message=".*pad_token_id.*")
         
         base_model = LlamaModel.from_pretrained(
-            args.model_path,
+            base_path,
             torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             low_cpu_mem_usage=True,
             device_map="auto" if torch.cuda.is_available() else None
         ).eval()
         
         # Use the correct concept set for CBLLM evaluation
-        if 'custom_echr' in concepts_from_labels:
-            concept_set = concepts_from_labels['custom_echr']
-            logger.info("Using custom_echr concept set from config.py")
+        if args.concept_set in concepts_from_labels:
+            concept_set = concepts_from_labels[args.concept_set]
+            logger.info(f"Using {args.concept_set} concept set from config.py")
         else:
-            logger.warning("custom_echr not found in concepts_from_labels, using default concepts")
+            logger.warning(f"{args.concept_set} not found in concepts_from_labels, using default concepts")
             concept_set = ['topic', 'sentiment', 'complexity', 'formality', 'technical']  # Fallback
         
         logger.info(f"Using concept set: {concept_set}")
         logger.info(f"Concept dimension: {len(concept_set)}")
         
-        
-        unsup_dim = CFG.unsup_dim.get('custom_echr', CFG.unsup_dim.get('default', config.hidden_size))
-        logger.info(f"Using unsupervised dimension: {unsup_dim}")
+        # Use provided unsup_dim or default from config
+        if args.unsup_dim is not None:
+            unsup_dim = args.unsup_dim
+            logger.info(f"Using unsupervised dimension from argument: {unsup_dim}")
+        else:
+            unsup_dim = CFG.unsup_dim.get(args.concept_set, CFG.unsup_dim.get('default', config.hidden_size))
+            logger.info(f"Using unsupervised dimension from config: {unsup_dim}")
         
         cbl_model = CBL(config, len(concept_set), tokenizer, unsup_dim=unsup_dim)
-
-        cbl_path = os.path.join(args.model_path, "cbl_epoch_2.pt") # Change to right file
         
         logger.info(f"Loading CBL weights from: {cbl_path}")
         

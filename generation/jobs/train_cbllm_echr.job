@@ -1,11 +1,11 @@
 #!/bin/bash
 
-#SBATCH --partition=gpu_a100          # Partition name
-#SBATCH --gres=gpu:1                  # Number of GPUs to allocate
-#SBATCH --job-name=vib_train          # Job name
+#SBATCH --partition=gpu_h100          # Partition name
+#SBATCH --gres=gpu:3                  # Number of GPUs to allocate
+#SBATCH --job-name=has_person_train   # Job name
 #SBATCH --ntasks=1                    # Number of tasks
-#SBATCH --time=12:00:00               # Time limit hh:mm:ss
-#SBATCH --output=/home/dpereira/CB-LLMs/disentangling/work/train_%A.out      # Standard output (%A expands to job ID)
+#SBATCH --time=24:00:00               # Time limit hh:mm:ss
+#SBATCH --output=/home/dpereira/CB-LLMs/generation/work/train_cbllm_has_person_%A.out      # Standard output (%A expands to job ID)
 
 ### --- MODULE SETUP / ENVIRONMENT ---
 module purge
@@ -34,7 +34,7 @@ export TOKENIZERS_PARALLELISM=false
 export CUDA_VISIBLE_DEVICES=0,1,2
 
 # Fix PyTorch conflicts by uninstalling and reinstalling
-cd /home/dpereira/CB-LLMs/disentangling
+cd /home/dpereira/CB-LLMs/generation
 echo "Fixing PyTorch installation conflicts..."
 pip uninstall -y torch torchvision torchaudio
 pip cache purge
@@ -54,34 +54,30 @@ python -c "import peft; print(f'PEFT version: {peft.__version__}')"
 # Debug CUDA setup
 python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA devices: {torch.cuda.device_count()}')"
 
-echo "Starting CB-LLM training with ECHR dataset and has_person binary classification..."
+### --- TRAIN CB-LLM MODEL WITH HAS_PERSON LABELS - 2 GPU VERSION ---
+echo "Starting CB-LLM training with ECHR dataset and has_person binary classification (2 GPU version)..."
 echo "Using fine-tuned Llama3 base model from experiment_00015..."
 
-# Train CB-LLM - Use training_stage1.py or training_stage2.py
-# Stage 1 example:
-# python training_stage1.py \
-#     --DATA custom_echr \
-#     --LATENT_DIM 4096 \
-#     --MODEL_NAME llama3 \
-#     --LAYER all \
-#     --LEARNING_RATE 1e-4 \
-#     --BETA 0.1 \
-#     --SEED 42
-
-# Stage 2 training:
-python -u training_stage2.py \
-    --DATA_S1 custom_echr \
-    --DATA_S2 custom_echr \
-    --LATENT_DIM 4096 \
-    --MODEL_NAME llama3 \
-    --LAYER_S1 all \
-    --LAYER_S2 30 \
-    --LEARNING_RATE 2e-4 \
-    --BETA_S1 0.1 \
-    --BETA_S2 0.5 \
-    --GAMMA 2.5 \
-    --SEED 42 \
-    --EPOCHS 10
+# Train CB-LLM with has_person binary classification using fine-tuned Llama3
+# With 3 GPUs we have 120GB total memory - should be plenty for CB-LLM components
+python train_CBLLM_multi_gpu.py \
+    --dataset custom_echr \
+    --batch_size 2 \
+    --max_length 300 \
+    --gradient_accumulation_steps 4 \
+    --num_workers 0 
 echo "CB-LLM training completed!"
+
+### --- TRAINING SUMMARY ---
+echo "Training Summary:"
+echo "- Dataset: Custom ECHR with has_person labels"
+echo "- Base Model: Fine-tuned Llama3 from experiment_00015"
+echo "- Task: Binary classification (has_person: 0/1)"
+echo "- Concepts: PII name detection concepts"
+echo "- Model saved to: ./models/from_pretained_llama3_lora_cbm/custom_echr/"
+
+# List generated model files
+echo "Generated model files:"
+ls -la ./models/from_pretained_llama3_lora_cbm/custom_echr/ 2>/dev/null || echo "Model directory not found"
 
 echo "Job completed successfully!"

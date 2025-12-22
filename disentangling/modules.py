@@ -45,6 +45,9 @@ class VIBConfig():
     layer_weight_averaging: Optional[bool] = False
     num_layers: Optional[int] = None
     cond_dim: Optional[int] = None  # Dimension of Stage 1 conditioning (for Stage 2 only)
+    # Variance clamp bounds for numerical stability in the encoder
+    var_clamp_min: Optional[float] = None
+    var_clamp_max: Optional[float] = None
 
 class VariationalEncoder(torch.nn.Module):
     def __init__(self, config):
@@ -53,66 +56,25 @@ class VariationalEncoder(torch.nn.Module):
         self.enc2 = torch.nn.Linear(config.input_dim, config.input_dim)
         self.mu = torch.nn.Linear(config.input_dim, config.latent_dim)
         self.var = torch.nn.Linear(config.input_dim, config.latent_dim)
+        # Set clamp bounds (use provided config values or fall back to safe defaults)
+        self.var_min = getattr(config, 'var_clamp_min', None)
+        self.var_max = getattr(config, 'var_clamp_max', None)
+        if self.var_min is None:
+            self.var_min = 0.1
+        if self.var_max is None:
+            self.var_max = 10.0
 
     def forward(self, h):
         o = F.gelu(self.enc1(h))
         o = F.gelu(self.enc2(o))
         
         mu = self.mu(o)
-        var = F.softplus(self.var(o)) # to generate positive values
+        
+        var = F.softplus(self.var(o)) + 1e-6 # Use softplus to generate positive values
+        var = torch.clamp(var, min=self.var_min, max=self.var_max)
         
         return mu, var
     
-    
-    def initialize_mu_from_compressed_weights(self, pretrained_weight, pretrained_bias=None):
-        """
-        Initialize the mu projection by copying compressed pretrained weights directly.
-        Uses SVD to compress arbitrary weight matrices to latent_dim dimensions.
-        
-        Args:
-            pretrained_weight: Weight tensor of shape [out_features, in_features]
-            pretrained_bias: Optional bias tensor
-        """
-        with torch.no_grad():
-            # Perform SVD: W = U @ diag(S) @ Vh
-            # For weight matrix [out_dim, in_dim], we compress the output dimension
-            U, S, Vh = torch.linalg.svd(pretrained_weight, full_matrices=False)
-            
-            latent_dim = self.mu.out_features
-            input_dim = self.mu.in_features
-            
-            # Determine how many components to use
-            k = min(latent_dim, U.shape[1], S.shape[0])
-            
-            # For mu layer: we need [latent_dim, input_dim]
-            # pretrained_weight is [pretrained_out, pretrained_in]
-            # We need to map pretrained_in -> input_dim
-            
-            # Take top-k right singular vectors (input space compression)
-            # and top-k left singular vectors (output space compression)
-            if pretrained_weight.shape[1] == input_dim:
-                # Input dimensions match, just compress output dimension
-                compressed_weight = U[:, :k].T * S[:k].unsqueeze(1) @ Vh[:k, :]
-                self.mu.weight.data[:k, :] = compressed_weight[:k, :]
-            else:
-                # Need to also compress input dimension
-                # Use top-k components: U[:, :k] @ diag(S[:k]) @ Vh[:k, :]
-                # Then truncate/pad to match our dimensions
-                n_in = min(k, Vh.shape[1], input_dim)
-                compressed_weight = torch.zeros(latent_dim, input_dim, device=pretrained_weight.device)
-                compressed_weight[:k, :n_in] = (U[:, :k].T * S[:k].unsqueeze(1))[:, :n_in]
-                self.mu.weight.data = compressed_weight
-            
-            # Handle bias
-            if self.mu.bias is not None and pretrained_bias is not None:
-                # Project bias through top-k left singular vectors
-                compressed_bias = U[:, :k].T @ pretrained_bias
-                self.mu.bias.data[:k] = compressed_bias[:k]
-            
-            print(f"Initialized mu layer from pretrained weights via SVD")
-            print(f"  Pretrained weight shape: {pretrained_weight.shape}")
-            print(f"  Mu layer shape: [{latent_dim}, {input_dim}]")
-            print(f"  Components used: {k}")
 
 class CBLDecoder(torch.nn.Module):
     def __init__(self, config):
@@ -130,58 +92,48 @@ class CBLDecoder(torch.nn.Module):
 class Decoder(torch.nn.Module):
     def __init__(self, config):
         super(Decoder, self).__init__()
+        # Stage 2 latent_dim should match LLaMA3 hidden size (4096)
         self.latent_dim = config.latent_dim
         
-        # Projection layer for Stage 1 conditioning if dimensions don't match
+        # Stage 1 conditioning dimension (should match latent_dim when both are 4096)
         self.cond_dim = getattr(config, 'cond_dim', config.latent_dim)
-        if self.cond_dim != self.latent_dim:
-            self.cond_projection = torch.nn.Linear(self.cond_dim, self.latent_dim)
+        
+        # Initialize alpha close to 1.0 to favor Stage 2 initially (per-component)
+        self.alpha = torch.nn.Parameter(torch.ones(self.latent_dim) * 0.8, requires_grad=True)
+        
+        # Input dimension is latent_dim (which equals LLaMA3 hidden size)
+        self.lm_head = torch.nn.Linear(self.latent_dim, config.num_classes, bias=False)
+        
+        # Load pre-trained lm_head weights from baseline model
+        baseline_lm_head_path = "/home/dpereira/CB-LLMs/analysing_pii_leakage/examples/experiments/experiment_00015/pytorch_model-00004-of-00004.bin"
+        if os.path.exists(baseline_lm_head_path):
+            print(f"Loading pre-trained lm_head from {baseline_lm_head_path}")
+            checkpoint = torch.load(baseline_lm_head_path, map_location=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+            if 'lm_head.weight' in checkpoint:
+                # Convert to float32 to match VIB model dtype
+                self.lm_head.weight.data = checkpoint['lm_head.weight'].float()
+                # Freeze the lm_head to prevent training
+                for param in self.lm_head.parameters():
+                    param.requires_grad = False
+                print(f"Loaded and froze lm_head weights from baseline model")
+            else:
+                print(f"Warning: 'lm_head.weight' not found in checkpoint")
         else:
-            self.cond_projection = None
-            
-        self.clf = torch.nn.Linear(config.latent_dim*2, config.num_classes)
-        # Project concatenated representation to LLaMA3 hidden size (4096)
-        #self.hidden_projection = torch.nn.Linear(config.latent_dim * 2, config.input_dim)
-        
-        # Final language modeling head (LLaMA uses no bias)
-        #self.lm_head = torch.nn.Linear(config.input_dim, config.num_classes, bias=False)
-        
-        # # Load pre-trained lm_head weights from baseline model
-        # baseline_lm_head_path = "/home/dpereira/CB-LLMs/analysing_pii_leakage/examples/experiments/experiment_00015/pytorch_model-00004-of-00004.bin"
-        # if os.path.exists(baseline_lm_head_path):
-        #     print(f"Loading pre-trained lm_head from {baseline_lm_head_path}")
-        #     checkpoint = torch.load(baseline_lm_head_path, map_location=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-        #     if 'lm_head.weight' in checkpoint:
-        #         self.lm_head.weight.data = checkpoint['lm_head.weight']
-        #         # Freeze the lm_head to prevent training
-        #         for param in self.lm_head.parameters():
-        #             param.requires_grad = False
-        #         print(f"Loaded and froze lm_head weights from baseline model")
-        #     else:
-        #         print(f"Warning: 'lm_head.weight' not found in checkpoint")
-        # else:
-        #     print(f"Warning: Baseline lm_head not found at {baseline_lm_head_path}")
+            print(f"Warning: Baseline lm_head not found at {baseline_lm_head_path}")
     
     def forward(self, z, m, cond):
-        # z: [batch, seq_len, latent_dim] - Stage 2 latent representation
-        # cond: [batch, seq_len, cond_dim] - Stage 1 latent representation (mu from encoder)
+        # z: [batch, seq_len, latent_dim] - Stage 2 latent (should match LLaMA3 hidden size)
+        # cond: [batch, seq_len, latent_dim] - Stage 1 latent representation (mu from encoder, same dim as z)
         
-        # Project conditioning to match Stage 2 latent dimension if needed
-        if self.cond_projection is not None:
-            cond = self.cond_projection(cond)  # [batch, seq_len, cond_dim] -> [batch, seq_len, latent_dim]
+        # Merge Stage 1 and Stage 2 via learned linear combination
+        # Clamp each alpha component to [0, 1] to ensure valid interpolation
+        alpha_clamped = torch.clamp(self.alpha, 0.0, 1.0)  # [latent_dim]
+        merged_latents = alpha_clamped.unsqueeze(0).unsqueeze(0) * z + (1 - alpha_clamped.unsqueeze(0).unsqueeze(0)) * cond  # [batch, seq_len, latent_dim]
         
-        batch_size, seq_len, latent_dim = z.shape
-        
-        # Concatenate Stage 1 and Stage 2 representations
-        concatenated = torch.cat([cond, z], dim=-1)  # [batch, seq_len, latent_dim*2]
-        
-        # Project to LLaMA3 hidden size
-        #hidden_repr = self.hidden_projection(concatenated)  # [batch, seq_len, input_dim (4096)]
-        logits = self.clf(concatenated)
         # Generate logits for language modeling
-        #logits = self.lm_head(hidden_repr)  # [batch, seq_len, num_classes (vocab_size)]
+        logits = self.lm_head(merged_latents)  # [batch, seq_len, num_classes (vocab_size)]
         
-        outputs = (logits,) # hidden_repr)
+        outputs = (logits, merged_latents)
         return outputs
 
 class VIB(torch.nn.Module):
@@ -205,6 +157,10 @@ class VIB(torch.nn.Module):
             # compute weighted sum over layers
             w = torch.nn.functional.softmax(self.layer_weights, dim=0)
             h = torch.sum(h * w.view(1, w.shape[0], 1, 1), dim=1)
+        else:
+            # If single layer is provided, squeeze the layer dimension
+            if h.dim() == 4 and h.shape[1] == 1:
+                h = h.squeeze(1)  # [batch, 1, seq_len, hidden_dim] -> [batch, seq_len, hidden_dim]
 
         mu, var = self.encoder(h)
         std = var ** 0.5
@@ -217,6 +173,8 @@ class VIB(torch.nn.Module):
 
         outputs = self.decoder(z, m, cond)
         
+        # For Stage 2, outputs is (logits, merged_latents, mu, var)
+        # For Stage 1, outputs is (logits, mu, var)
         return outputs + (mu, var)
     
     def generate(self, ids, preLM, cond=None, mask=None, intervene=None, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001):
