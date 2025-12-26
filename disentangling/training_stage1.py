@@ -1,7 +1,3 @@
-"""
-Stage 1 Training: PII Detection (token-level PERSON classification)
-Trains a Variational Information Bottleneck (VIB) model to detect person entities in text.
-"""
 import argparse
 import sys, os
 import pickle

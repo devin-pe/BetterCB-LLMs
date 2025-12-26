@@ -69,19 +69,26 @@ echo "Using fine-tuned Llama3 base model from experiment_00015..."
 #     --SEED 42
 
 # Stage 2 training:
-python -u training_stage2.py \
-    --DATA_S1 custom_echr \
-    --DATA_S2 custom_echr \
+# python -u training_stage2.py \
+#     --DATA_S1 custom_echr \
+#     --DATA_S2 custom_echr \
+#     --LATENT_DIM 4096 \
+#     --MODEL_NAME llama3 \
+#     --LAYER_S1 all \
+#     --LAYER_S2 30 \
+#     --LEARNING_RATE 2e-4 \
+#     --BETA_S1 0.1 \
+#     --BETA_S2 1.0 \
+#     --GAMMA 2.5 \
+#     --SEED 42 \
+#     --EPOCHS 10
+# echo "CB-LLM training completed!"
+
+python -u training_cbllm_old.py \
+    --STAGE 2 \
     --LATENT_DIM 4096 \
-    --MODEL_NAME llama3 \
-    --LAYER_S1 all \
-    --LAYER_S2 30 \
     --LEARNING_RATE 2e-4 \
     --BETA_S1 0.1 \
-    --BETA_S2 0.5 \
-    --GAMMA 2.5 \
-    --SEED 42 \
-    --EPOCHS 10
-echo "CB-LLM training completed!"
+    --BETA_S2 0.1 \
 
 echo "Job completed successfully!"

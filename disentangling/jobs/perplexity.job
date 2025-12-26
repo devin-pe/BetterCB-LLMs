@@ -35,13 +35,22 @@ pip install datasets
 ### --- RUN ---
 cd "$REPO_ROOT/disentangling"
 
-python perplexity.py \
-    --model_path /home/dpereira/CB-LLMs/disentangling/models/vib/norm_2/custom_echr_custom_echr/llama3/ \
-    --base_model_path /home/dpereira/CB-LLMs/analysing_pii_leakage/examples/experiments/experiment_00015 \
-    --stage 2 \
-    --layer_s1 all \
-    --layer_s2 30 \
-    --stride 1024 \
-    --stage1_model_path ~/CB-LLMs/disentangling/models/vib/4096_1/custom_echr/llama3/ \
+# Evaluate baseline LLaMA3 perplexity on ECHR test set (no stride, 512 max_length like training)
+python eval_baseline_perplexity.py \
+    --model_path /home/dpereira/CB-LLMs/analysing_pii_leakage/examples/experiments/experiment_00015 \
+    --data_path /home/dpereira/CB-LLMs/generation/dataset/ \
+    --max_length 512 \
+    --batch_size 4 \
+    --gpu 0
+
+# Original VIB perplexity evaluation (commented out)
+# python perplexity.py \
+#     --model_path /home/dpereira/CB-LLMs/disentangling/models/vib/norm_2/custom_echr_custom_echr/llama3/ \
+#     --base_model_path /home/dpereira/CB-LLMs/analysing_pii_leakage/examples/experiments/experiment_00015 \
+#     --stage 2 \
+#     --layer_s1 all \
+#     --layer_s2 30 \
+#     --stride 1024 \
+#     --stage1_model_path ~/CB-LLMs/disentangling/models/vib/4096_1/custom_echr/llama3/ \
 
 echo "Perplexity evaluation completed!"

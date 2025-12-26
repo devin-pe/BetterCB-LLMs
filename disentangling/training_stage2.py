@@ -1,7 +1,3 @@
-"""
-Stage 2 Training: Language Modeling with Stage 1 Conditioning
-Trains a VIB model for language modeling while conditioning on Stage 1 PII representations.
-"""
 import argparse
 import sys, os
 import pickle
@@ -21,40 +17,63 @@ from modules import VIB, VIBConfig
 from dataset_utils import load_echr_data, prepare_dataset_stage2, create_collate_fn
 
 
-class GradientReversalFunction(torch.autograd.Function):
-    """Gradient Reversal Layer from 'Domain-Adversarial Training of Neural Networks' (Ganin et al.)
+def build_position_vocab(dataset):
+    """Build vocabulary of unique position patterns"""
+    unique_positions = set()
+    for sample in dataset:
+        unique_positions.add(sample['position'])
+    position_to_idx = {pos: idx for idx, pos in enumerate(sorted(unique_positions))}
+    return position_to_idx
+
+
+def position_strings_to_indices(position_strings, position_to_idx):
+    """Convert position strings to class indices"""
+    indices = [position_to_idx[pos_str] for pos_str in position_strings]
+    return torch.tensor(indices, dtype=torch.long)
+
+
+def has_pii_in_position(position_string):
+    """Check if position string contains any PII (any 1s)"""
+    return any(int(x) == 1 for x in position_string.split(','))
+
+
+def prepare_dataset_stage2_with_position(batch, tokenizer, max_length=512):
+    """Prepare batch for Stage 2 but keep position field for adversarial classification"""
+    tokenized = tokenizer(
+        batch["text"],
+        padding=False,
+        truncation=True,
+        max_length=max_length
+    )
     
-    Forward pass: identity function
-    Backward pass: negates gradients (multiplies by -lambda)
-    This makes the encoder learn features that FOOL the classifier (adversarial)
-    """
-    @staticmethod
-    def forward(ctx, x, lambda_):
-        ctx.lambda_ = lambda_
-        return x.view_as(x)
-    
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output.neg() * ctx.lambda_, None
+    return {
+        'input_ids': tokenized['input_ids'],
+        'attention_mask': tokenized['attention_mask'],
+        'labels': tokenized['input_ids'],
+        'position': batch['position']  # Keep position for adversarial classification
+    }
 
 
-class GradientReversalLayer(torch.nn.Module):
-    def __init__(self, lambda_=1.0):
-        super().__init__()
-        self.lambda_ = lambda_
-    
-    def forward(self, x):
-        return GradientReversalFunction.apply(x, self.lambda_)
-
-
-def extract_has_person_labels(position_strings):
-    """Extract binary has_person labels from position strings"""
-    labels = []
-    for pos_str in position_strings:
-        pos_list = [int(x) for x in pos_str.split(',')]
-        has_person = 1 if any(pos_list) else 0
-        labels.append(has_person)
-    return torch.tensor(labels, dtype=torch.long)
+def create_collate_fn_with_position(tokenizer):
+    """Collate function that preserves position field"""
+    def collate_fn(batch):
+        input_ids_list = [torch.tensor(x["input_ids"]) for x in batch]
+        attention_mask_list = [torch.tensor(x["attention_mask"]) for x in batch]
+        labels_list = [torch.tensor(x["labels"]) for x in batch]
+        position_list = [x["position"] for x in batch]
+        
+        # Pad sequences
+        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids_list, batch_first=True, padding_value=tokenizer.pad_token_id)
+        attention_mask = torch.nn.utils.rnn.pad_sequence(attention_mask_list, batch_first=True, padding_value=0)
+        labels = torch.nn.utils.rnn.pad_sequence(labels_list, batch_first=True, padding_value=-100)
+        
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "position": position_list
+        }
+    return collate_fn
 
 
 def parse_args():
@@ -79,6 +98,8 @@ def parse_args():
     parser.add_argument("--BATCH_SIZE", type=int, default=4)
     parser.add_argument("--EPOCHS", type=int, default=10)
     parser.add_argument("--EVAL_FREQ", type=int, default=10)
+    parser.add_argument("--ADV_STEPS", type=int, default=3,
+                        help='Number of adversarial classifier training steps per batch (default: 3)')
     return parser.parse_args()
 
 
@@ -97,8 +118,8 @@ def main():
     DATA_PATH = "/home/dpereira/CB-LLMs/generation/dataset/"
     LOAD_STAGE1_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/models/vib/4096_1/{args.DATA_S1}/{args.MODEL_NAME}/"
     DATA_ = args.DATA_S1 + "_" + args.DATA_S2
-    SAVE_REPORTS_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/reports/vib/adv_2/{DATA_}/{args.MODEL_NAME}/"
-    SAVE_MODEL_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/models/vib/adv_2/{DATA_}/{args.MODEL_NAME}/"
+    SAVE_REPORTS_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/reports/vib/alternate_2/{DATA_}/{args.MODEL_NAME}/"
+    SAVE_MODEL_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/models/vib/alternate_2/{DATA_}/{args.MODEL_NAME}/"
     
     print(f"Model will be saved at {SAVE_MODEL_PATH}")
     
@@ -133,7 +154,7 @@ def main():
     # # Using the final layer norm from the base model ensures proper scale
     # llama3_norm = base_model.norm  # LLaMA's final RMSNorm layer
     # llama3_norm.eval()  # Keep frozen during training
-    # print(f"Extracted RMSNorm from LLaMA3 base model (will be applied after merging)")
+    print(f"Extracted RMSNorm from LLaMA3 base model (will be applied after merging)")
     
     # Enable gradient checkpointing for memory efficiency
     if hasattr(base_model, 'gradient_checkpointing_enable'):
@@ -208,33 +229,37 @@ def main():
     model.to(device)
     model.train()
     
-    # Add Gradient Reversal Layer + classifier for adversarial training
-    # GRL reverses gradients during backprop, so encoder learns to FOOL the classifier
-    # Classifier learns to DETECT has_person from Stage 2 mu
-    gradient_reversal = GradientReversalLayer(lambda_=1.0).to(device)
-    adversarial_classifier = torch.nn.Linear(LATENT_DIM, 2).to(device)
-    adversarial_classifier.train()
-    print(f"Initialized Gradient Reversal Layer with lambda=1.0")
-    
-    # Load data
+    # Load datasets
     print("Loading datasets...")
-    # Load with stage="1" to get position labels for has_person extraction
-    train_data = load_echr_data('train', stage="1", data_path=DATA_PATH)
-    test_data = load_echr_data('test', stage="1", data_path=DATA_PATH)
+    # Load with stage="1" to get position labels (for token-level PII mask)
+    train_data_raw = load_echr_data('train', stage="1", data_path=DATA_PATH)
+    test_data_raw = load_echr_data('test', stage="1", data_path=DATA_PATH)
+    
+    # Adversarial classifier for token-level training
+    # Predicts which sample (0 to batch_size-1) a PII token belongs to
+    # This forces encoder to remove sample-specific PII patterns
+    max_batch_size = args.BATCH_SIZE  # Maximum number of classes (samples in batch)
+    adversarial_classifier = torch.nn.Sequential(
+        torch.nn.Linear(LATENT_DIM, 512),
+        torch.nn.ReLU(),
+        torch.nn.Dropout(0.1),
+        torch.nn.Linear(512, max_batch_size)  # Predict sample index within batch
+    ).to(device)
+    adversarial_classifier.train()
+    print(f"Initialized token-level adversarial classifier (predicts sample index, max {max_batch_size} classes)")
     
     # Prepare datasets
     print("[DEBUG] About to map train_data...")
-    train_data = train_data.map(lambda batch: prepare_dataset_stage2(batch, tokenizer, args.MAX_LENGTH), batched=True)
+    train_data = train_data_raw.map(lambda batch: prepare_dataset_stage2_with_position(batch, tokenizer, args.MAX_LENGTH), batched=True)
     print("[DEBUG] Train data mapped successfully")
     
     print("[DEBUG] About to map test_data...")
-    test_data = test_data.map(lambda batch: prepare_dataset_stage2(batch, tokenizer, args.MAX_LENGTH), batched=True)
+    test_data = test_data_raw.map(lambda batch: prepare_dataset_stage2_with_position(batch, tokenizer, args.MAX_LENGTH), batched=True)
     print("[DEBUG] Test data mapped successfully")
     
     # Create data loaders
     print("[DEBUG] Creating collate_fn...")
-    collate_fn = create_collate_fn(stage="2", tokenizer=tokenizer)
-    collate_fn = create_collate_fn(stage="2", tokenizer=tokenizer)
+    collate_fn = create_collate_fn_with_position(tokenizer)
     print("[DEBUG] Collate_fn created successfully")
     
     print("[DEBUG] Creating train_dataloader...")
@@ -266,19 +291,32 @@ def main():
     
     print(f"Training steps per epoch: {training_steps}")
     
+    # Count PII tokens for monitoring
+    print("[DEBUG] Counting PII tokens in training data...")
+    total_pii_tokens = 0
+    total_tokens = 0
+    for sample in train_data:
+        pos_labels = [int(x) for x in sample['position'].split(',')]
+        total_pii_tokens += sum(pos_labels)
+        total_tokens += len(pos_labels)
+    pii_ratio = total_pii_tokens / total_tokens if total_tokens > 0 else 0
+    print(f"[INFO] PII tokens: {total_pii_tokens} / {total_tokens} ({100*pii_ratio:.1f}%)")
+    
     # Print run configuration
     print("\n" + "="*80)
-    print("STAGE 2 TRAINING CONFIGURATION (with Gradient Reversal Layer)")
+    print("STAGE 2 TRAINING CONFIGURATION (Token-Level Adversarial Training)")
+
     print("="*80)
     print(f"Total Epochs: {args.EPOCHS}")
     print(f"Batch Size: {args.BATCH_SIZE}")
     print(f"Learning Rate: {args.LEARNING_RATE}")
     print(f"Stage 1 Latent Dimension: {stage1_latent_dim}")
     print(f"Stage 2 Latent Dimension: {LATENT_DIM}")
-    print(f"Beta S2 (GRL Adversarial): {args.BETA_S2}")
+    print(f"Beta S2 (Adversarial): {args.BETA_S2}")
     print(f"Gamma (MSE weight): {args.GAMMA}")
     print(f"Layer S1: {args.LAYER_S1}, Layer S2: {args.LAYER_S2}")
-    print(f"Adversarial Method: Gradient Reversal Layer (Ganin et al.)")
+    print(f"Adversarial Method: Alternating Training (classifier → encoder)")
+    print(f"Adv steps per batch: {args.ADV_STEPS} classifier, 1 encoder")
     print(f"Model save location: {SAVE_MODEL_PATH}")
     print("="*80 + "\n")
     
@@ -287,24 +325,24 @@ def main():
     metric = load('perplexity', experiment_id=str(uuid.uuid4()))
     print("[DEBUG] Metric loaded successfully")
     
-    print("[DEBUG] Creating optimizer...")
-    # Include both VIB and adversarial classifier parameters (GRL has no parameters)
-    all_params = list(model.parameters()) + list(adversarial_classifier.parameters())
-    optimizer = AdamW(params=all_params, lr=args.LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    print("[DEBUG] Optimizer created successfully")
+    print("[DEBUG] Creating optimizers...")
+    # Separate optimizers for alternating training
+    vib_optimizer = AdamW(params=model.parameters(), lr=args.LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    adv_optimizer = AdamW(params=adversarial_classifier.parameters(), lr=args.LEARNING_RATE * 2, weight_decay=WEIGHT_DECAY)
+    print("[DEBUG] Optimizers created successfully")
     
     print("[DEBUG] Creating learning rate scheduler...")
-    lr_scheduler = get_cosine_schedule_with_warmup(
-        optimizer, 
+    vib_scheduler = get_cosine_schedule_with_warmup(
+        vib_optimizer, 
         num_warmup_steps=int(WARMUP_RATIO * total_training_steps), 
         num_training_steps=total_training_steps
     )
     print("[DEBUG] LR scheduler created successfully")
     
     beta_s2 = float(args.BETA_S2)
-    beta_mse = float(args.GAMMA)
+    gamma = float(args.GAMMA)
     print(f"[INFO] Beta S2 (adversarial loss): {beta_s2}")
-    print(f"[DEBUG] Gamma (MSE weight): beta_mse={beta_mse}")
+    print(f"[DEBUG] Gamma (MSE weight): gamma={gamma}")
     
     # Training loop
     train_losses = {'Task': [], 'Info': [], 'MSE': [], 'Total': []}
@@ -332,13 +370,13 @@ def main():
         for step, batch in enumerate(train_dataloader):
             if step == 0:
                 print(f"[DEBUG] Epoch {epoch+1}, Step {step}: Got first batch from dataloader")
-                print(f"[DEBUG]   Batch keys: {batch.keys()}")
-                print(f"[DEBUG]   input_ids shape: {batch['input_ids'].shape if 'input_ids' in batch else 'N/A'}")
-            
-            # Move batch to device
+                
+            # Move batch to device (except position which is a list of strings)
             if step == 0:
                 print(f"[DEBUG] Epoch {epoch+1}, Step {step}: Moving batch to device...")
+            position_strings = batch.pop('position')  # Remove position before moving to device
             batch = {k: v.to(device) for k, v in batch.items()}
+            batch['position'] = position_strings  # Add back position as list
             if step == 0:
                 print(f"[DEBUG] Epoch {epoch+1}, Step {step}: Batch moved to device")
             
@@ -377,8 +415,17 @@ def main():
                     noise=False 
                 )
             
-            # Extract has_person labels from position strings
-            has_person_labels = extract_has_person_labels(batch['position']).to(device)
+            # Extract token-level position labels (binary: 1=PII, 0=non-PII)
+            # Convert position strings to token-level binary masks
+            batch_size = batch["input_ids"].shape[0]
+            seq_len = batch["input_ids"].shape[1]
+            pii_mask = torch.zeros(batch_size, seq_len, device=device, dtype=torch.bool)
+            
+            for i, pos_str in enumerate(batch['position']):
+                pos_labels = [int(x) for x in pos_str.split(',')]
+                # Truncate or pad to match sequence length
+                pos_labels = pos_labels[:seq_len] + [0] * (seq_len - len(pos_labels))
+                pii_mask[i] = torch.tensor(pos_labels, dtype=torch.bool, device=device)
             
             # Forward Stage 2 VIB model
             outputs_vib = model(
@@ -389,25 +436,52 @@ def main():
             )
             logits, merged_latents, mu, var = outputs_vib
             
-            # # Apply RMSNorm to merged_latents before decoding (matches LLaMA3's output normalization)
-            # # Note: MSE will use pre-norm merged_latents, but decoder gets normalized version
+            # Apply RMSNorm to merged_latents before decoding (matches LLaMA3's output normalization)
             # with torch.no_grad():
             #     merged_latents_normalized = llama3_norm(merged_latents)
             
-            # Adversarial loss with Gradient Reversal Layer
-            # Pool mu across sequence dimension (mean pooling over valid tokens)
-            attention_mask_expanded = batch["attention_mask"].unsqueeze(-1).float()
-            pooled_mu = (mu * attention_mask_expanded).sum(dim=1) / attention_mask_expanded.sum(dim=1).clamp(min=1.0)
+            # Token-level adversarial training:
+            # Only train on tokens where position=1 (PII entities)
+            # Combine PII mask with attention mask (only valid PII tokens)
+            valid_pii_mask = pii_mask & batch["attention_mask"].bool()
+            num_pii_tokens = valid_pii_mask.sum().item()
             
-            # Pass through GRL: forward = identity, backward = gradient reversal
-            # This makes encoder learn to FOOL classifier while classifier learns to DETECT PII
-            pooled_mu_reversed = gradient_reversal(pooled_mu)
-            adv_logits = adversarial_classifier(pooled_mu_reversed)
-            
-            # Standard cross-entropy loss: classifier tries to predict has_person correctly
-            # Encoder (via reversed gradients) tries to maximize this loss = fool classifier
-            adv_loss = F.cross_entropy(adv_logits, has_person_labels)
-            
+            if num_pii_tokens > 0:
+                # Extract latents only at PII positions [num_pii_tokens, latent_dim]
+                pii_latents = mu[valid_pii_mask]  # Shape: [num_pii_tokens, 4096]
+                
+                # For each PII token, we want to predict which document it came from
+                # This forces the encoder to remove document-specific PII patterns
+                # Create labels: which sample each PII token belongs to
+                sample_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, seq_len)
+                pii_sample_labels = sample_indices[valid_pii_mask]  # [num_pii_tokens]
+                
+                # === PHASE 1: Train adversarial classifier (args.ADV_STEPS steps) ===
+                # Classifier learns to predict which sample each PII token came from
+                for adv_step in range(args.ADV_STEPS):
+                    adv_logits = adversarial_classifier(pii_latents.detach())  # [num_pii_tokens, batch_size]
+                    # Predict which sample (0 to batch_size-1) this PII token belongs to
+                    adv_loss_cls = F.cross_entropy(adv_logits[:, :batch_size], pii_sample_labels)
+                    
+                    adv_optimizer.zero_grad()
+                    adv_loss_cls.backward()
+                    adv_optimizer.step()
+                
+                # === PHASE 2: Train encoder to produce sample-invariant PII representations ===
+                # Encoder learns to make PII tokens indistinguishable across samples
+                adv_logits_enc = adversarial_classifier(pii_latents)  # gradients flow to encoder
+                # Uniform target: equal probability for all samples
+                uniform_target = torch.ones(num_pii_tokens, batch_size, device=device) / batch_size
+                # KL divergence pushes predictions toward uniform
+                adv_loss = F.kl_div(
+                    F.log_softmax(adv_logits_enc[:, :batch_size], dim=-1), 
+                    uniform_target, 
+                    reduction='batchmean'
+                )
+            else:
+                # No PII tokens in this batch
+                adv_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                        
             # Compute MSE regression to LLaMA3's layer 31 (pre-RMSNorm)
             # We compare pre-norm merged_latents to pre-norm layer 31 output
             mse_loss = F.mse_loss(merged_latents, llama3_last_hidden, reduction='none').mean(dim=-1)
@@ -430,7 +504,7 @@ def main():
             task_loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
             
             # Total loss: task + adversarial (encourages PII independence) + MSE (representation quality)
-            total_loss = task_loss + beta_s2 * adv_loss + beta_mse * mse_loss
+            total_loss = task_loss + beta_s2 * adv_loss + gamma * mse_loss
             
             # Check for NaN
             if torch.isnan(total_loss).any():
@@ -438,7 +512,7 @@ def main():
                 print(f"  task_loss: {task_loss.item():.4f}")
                 print(f"  adv_loss (GRL): {adv_loss.item() if not torch.isnan(adv_loss) else 'NaN'}")
                 print(f"  mse_loss: {mse_loss.item():.4f}")
-                print(f"  beta_s2: {beta_s2}, beta_mse: {beta_mse}")
+                print(f"  beta_s2: {beta_s2}, gamma: {gamma}")
                 print(f"  mu stats - min: {mu.min().item():.6e}, max: {mu.max().item():.6e}, mean: {mu.mean().item():.6e}")
                 print(f"  var stats - min: {var.min().item():.6e}, max: {var.max().item():.6e}, mean: {var.mean().item():.6e}")
                 print("  Stopping training to prevent NaN propagation.")
@@ -450,17 +524,17 @@ def main():
                 print(f"  task_loss: {task_loss.item():.4f}")
                 print(f"  adv_loss: {adv_loss.item():.4f}")
                 print(f"  mse_loss: {mse_loss.item():.4f}")
-                print(f"  beta_s2: {beta_s2}, beta_mse: {beta_mse}")
-                print(f"  Breakdown: task={task_loss.item():.4f} + beta_s2*adv={beta_s2}*{adv_loss.item():.4f} + beta_mse*mse={beta_mse}*{mse_loss.item():.4f}")
+                print(f"  beta_s2: {beta_s2}, gamma: {gamma}")
+                print(f"  Breakdown: task={task_loss.item():.4f} + beta_s2*adv={beta_s2}*{adv_loss.item():.4f} + gamma*mse={gamma}*{mse_loss.item():.4f}")
                 print(f"  mu stats - min: {mu.min().item():.6e}, max: {mu.max().item():.6e}, mean: {mu.mean().item():.6e}")
                 print(f"  var stats - min: {var.min().item():.6e}, max: {var.max().item():.6e}, mean: {var.mean().item():.6e}")
             
-            # Backward pass with gradient clipping
+            # Backward pass with gradient clipping (for VIB only, adversarial already trained)
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad()
+            vib_optimizer.step()
+            vib_scheduler.step()
+            vib_optimizer.zero_grad()
             
             # Track losses
             epoch_task_loss += task_loss.item()
@@ -484,11 +558,11 @@ def main():
             best_total_loss = avg_total_loss
             best_model_state = {k: v.clone().cpu() for k, v in model.state_dict().items()}
             print(f"Epoch {epoch+1}/{args.EPOCHS}, Task Loss: {avg_task_loss:.4f}, "
-                  f"Adv Loss (GRL): {avg_adv_loss:.4f}, MSE Loss: {avg_mse_loss:.4f}, "
+                  f"Adv Loss (Alt): {avg_adv_loss:.4f}, MSE Loss: {avg_mse_loss:.4f}, "
                   f"Total Loss: {avg_total_loss:.4f} -> New best!")
         else:
             print(f"Epoch {epoch+1}/{args.EPOCHS}, Task Loss: {avg_task_loss:.4f}, "
-                  f"Adv Loss (GRL): {avg_adv_loss:.4f}, MSE Loss: {avg_mse_loss:.4f}, "
+                  f"Adv Loss (Alt): {avg_adv_loss:.4f}, MSE Loss: {avg_mse_loss:.4f}, "
                   f"Total Loss: {avg_total_loss:.4f}")
         
         # Evaluation
@@ -498,6 +572,9 @@ def main():
             all_references = []
             
             for batch in test_dataloader:
+                # Remove position before moving to device (it's a list of strings)
+                if 'position' in batch:
+                    batch.pop('position')
                 batch = {k: v.to(device) for k, v in batch.items()}
                 
                 with torch.no_grad():

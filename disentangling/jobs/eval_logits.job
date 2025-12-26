@@ -2,10 +2,10 @@
 
 #SBATCH --partition=gpu_a100          # Partition name
 #SBATCH --gres=gpu:1                  # Number of GPUs to allocate
-#SBATCH --job-name=probe              # Job name
+#SBATCH --job-name=eval_logits        # Job name
 #SBATCH --ntasks=1                    # Number of tasks
 #SBATCH --time=04:00:00               # Time limit hh:mm:ss
-#SBATCH --output=/home/dpereira/CB-LLMs/disentangling/work/probe_%A.out      # Standard output (%A expands to job ID)
+#SBATCH --output=/home/dpereira/CB-LLMs/disentangling/work/eval_logits_%A.out      # Standard output (%A expands to job ID)
 
 ### --- MODULE SETUP / ENVIRONMENT ---
 module purge
@@ -36,11 +36,16 @@ pip install -r requirements.txt || true
 echo "Printing versions for debugging"
 python -c "import sys; import torch; import transformers; print('Python:', sys.version.split()[0]); print('PyTorch:', getattr(torch,'__version__', 'n/a')); print('Transformers:', getattr(transformers,'__version__','n/a'))"
 
-echo "Running Stage-2 latent evaluation script"
-python probe.py \
+echo "Running Stage-2 VIB top-k prediction evaluation at PII positions"
+python eval_logits.py \
   --stage1_ckpt ~/CB-LLMs/disentangling/models/vib/4096_1/custom_echr/llama3/ \
   --stage2_ckpt ~/CB-LLMs/disentangling/models/vib/alternate_2/custom_echr_custom_echr/llama3/ \
   --layer_s1 all \
   --layer_s2 30 \
+  --num_pii_tokens 1000 \
+  --top_k 5 \
+  --max_length 512 \
+  --seed 42 \
+  --gpu 0
 
 echo "Evaluation job finished"

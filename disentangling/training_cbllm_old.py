@@ -10,7 +10,6 @@ parser.add_argument("--LAYER_S2", type=str, default="all")
 parser.add_argument("--LEARNING_RATE", type=float, default=1e-4)
 parser.add_argument("--BETA_S1", type=float, default=0.1)
 parser.add_argument("--BETA_S2", type=float, default=0.1)
-parser.add_argument("--BETA_S2_MSE", type=float, default=0.01)
 parser.add_argument("--SEED", type=int, default=42)
 parser.add_argument("--NO_IB", action='store_true')
 parser.add_argument("--MAX_LENGTH", type=int, default=512)
@@ -26,7 +25,6 @@ LAYER_S2 = args.LAYER_S2
 LEARNING_RATE = args.LEARNING_RATE
 BETA_S1 = args.BETA_S1
 BETA_S2 = args.BETA_S2
-BETA_S2_MSE = args.BETA_S2_MSE
 NO_IB = args.NO_IB
 SEED = args.SEED
 MAX_LENGTH = args.MAX_LENGTH
@@ -59,8 +57,8 @@ print(f"Task objective: {OBJECTIVE}")
 # Paths
 DATA_PATH = "/home/dpereira/CB-LLMs/generation/dataset/"
 LOAD_STAGE1_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/models/vib/4096_1/{DATA_S1}/{MODEL_NAME}/"
-SAVE_REPORTS_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/reports/vib/0_{STAGE}/{DATA_}/{MODEL_NAME}/"
-SAVE_MODEL_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/models/vib/0_{STAGE}/{DATA_}/{MODEL_NAME}/"
+SAVE_REPORTS_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/reports/vib/no_mse_{STAGE}/{DATA_}/{MODEL_NAME}/"
+SAVE_MODEL_PATH = f"{os.environ['HOME']}/CB-LLMs/disentangling/models/vib/no_mse_{STAGE}/{DATA_}/{MODEL_NAME}/"
 print(f"Model will be saved at {SAVE_MODEL_PATH}")
 ## Imports
 import pickle
@@ -318,7 +316,6 @@ print(f"Model save location: {SAVE_MODEL_PATH}")
 print(f"Stage: {STAGE}")
 print(f"Latent dimension: {LATENT_DIM}")
 print(f"Beta (Stage 2): {BETA_S2}")
-print(f"Beta MSE (Stage 2): {BETA_S2_MSE}")
 print("="*80 + "\n")
 
 # Load metrics & optimizer
@@ -351,14 +348,12 @@ for epoch in range(EPOCHS):
     model.train()
     epoch_task_loss = 0
     epoch_info_loss = 0
-    epoch_mse_loss = 0
     epoch_total_loss = 0
     
     for step, batch in enumerate(train_dataloader):
         # Move batch to device
         batch = {k: v.to(device) for k, v in batch.items()}
         
-        mse_loss = torch.tensor(0.0, device=device)
         
         # Feature extraction from pre-trained language model
         with torch.no_grad():
@@ -409,20 +404,9 @@ for epoch in range(EPOCHS):
             info_loss = torch.tensor(0.0, device=device)
         else:
             if STAGE == "2":
-                # KL divergence in Stage 1 space: KL(q(z2)||q(z1))
-                
-                # kl_div = 0.5 * (var / var1 + (mu2_in_stage1 - mu1).pow(2) / var1 + torch.log(var1 / var) - 1)
-                # info_loss = torch.masked_select(kl_div.sum(dim=-1), batch["attention_mask"].bool()).mean()
-                info_loss = torch.tensor(0.0, device=device)
-
-                # Compute MSE regression to LLaMA3's last hidden layer (reuse from initial forward pass)
-                mse_loss = F.mse_loss(merged_latents, llama3_last_hidden, reduction='none').mean(dim=-1)
-                mse_loss = torch.masked_select(mse_loss, batch["attention_mask"].bool()).mean()
-                
-                if torch.isnan(mse_loss).any():
-                    print(f"WARNING: NaN detected in mse_loss at epoch {epoch+1}, step {step}")
-                    print(f"  merged_latents: min={merged_latents.min():.4f}, max={merged_latents.max():.4f}, has_nan={torch.isnan(merged_latents).any()}")
-                    print(f"  llama3_last_hidden: min={llama3_last_hidden.min():.4f}, max={llama3_last_hidden.max():.4f}, has_nan={torch.isnan(llama3_last_hidden).any()}")
+                # Stage 2: KL divergence to uniform prior (same as Stage 1)
+                info_loss = -0.5 * torch.sum(1 + torch.log(var) - mu.pow(2) - var, dim=-1)
+                info_loss = torch.masked_select(info_loss, batch["attention_mask"].bool()).mean()
 
             else:
                 # Stage 1: KL divergence loss (per-token)
@@ -461,15 +445,12 @@ for epoch in range(EPOCHS):
             print(f"  shift_logits: min={shift_logits.min():.4f}, max={shift_logits.max():.4f}, has_nan={torch.isnan(shift_logits).any()}")
             print(f"  shift_labels: min={shift_labels.min()}, max={shift_labels.max()}")
         
-        beta2 = BETA_S2_MSE if STAGE == "2" else 0.0
-        total_loss = task_loss + beta * info_loss + beta2 * mse_loss
+        total_loss = task_loss + beta * info_loss 
         
         if torch.isnan(total_loss).any():
             print(f"ERROR: NaN detected in total_loss at epoch {epoch+1}, step {step}")
             print(f"  task_loss: {task_loss.item():.4f}")
             print(f"  info_loss: {info_loss.item():.4f} (beta={beta:.4f})")
-            if STAGE == "2":
-                print(f"  mse_loss: {mse_loss.item():.4f} (beta2={beta2:.4f})")
             print(f"  total_loss: {total_loss.item():.4f}")
             print("  Stopping training to prevent NaN propagation.")
             break
@@ -479,8 +460,6 @@ for epoch in range(EPOCHS):
             print(f"WARNING: Extremely large loss detected at epoch {epoch+1}, step {step}: {total_loss.item():.4f}")
             print(f"  task_loss: {task_loss.item():.4f}")
             print(f"  info_loss: {info_loss.item():.4f}")
-            if STAGE == "2":
-                print(f"  mse_loss: {mse_loss.item():.4f}")
             print("  Skipping this batch to prevent gradient explosion.")
             continue
         
@@ -492,13 +471,10 @@ for epoch in range(EPOCHS):
 
         task_loss_val = task_loss.item()
         info_loss_val = info_loss.item() if not NO_IB else 0.0
-        mse_loss_val = mse_loss.item() if STAGE == "2" else 0.0
         total_loss_val = total_loss.item()
         epoch_task_loss += task_loss_val
         if not NO_IB:
             epoch_info_loss += info_loss_val
-        if STAGE == "2":
-            epoch_mse_loss += mse_loss_val
         epoch_total_loss += total_loss_val
         
         if BETA == "incremental":
@@ -507,7 +483,6 @@ for epoch in range(EPOCHS):
     avg_total_loss = epoch_total_loss / len(train_dataloader)
     avg_task_loss = epoch_task_loss / len(train_dataloader)
     avg_info_loss = epoch_info_loss / len(train_dataloader) if not NO_IB else 0.0
-    avg_mse_loss = epoch_mse_loss / len(train_dataloader) if STAGE == "2" else 0.0
     
     train_losses['Task'].append(avg_task_loss)
     if not NO_IB:
@@ -518,8 +493,6 @@ for epoch in range(EPOCHS):
         print(f"ERROR: NaN detected in epoch {epoch+1} averages:")
         print(f"  avg_task_loss: {avg_task_loss:.4f}")
         print(f"  avg_info_loss: {avg_info_loss:.4f}")
-        if STAGE == "2":
-            print(f"  avg_mse_loss: {avg_mse_loss:.4f}")
         print(f"  avg_total_loss: {avg_total_loss:.4f}")
         print(f"  Best model NOT updated (keeping best from epoch with loss {best_total_loss:.4f})")
     
@@ -531,7 +504,6 @@ for epoch in range(EPOCHS):
     if STAGE == "2":
         print(f"Epoch {epoch+1}/{EPOCHS}, Task Loss: {epoch_task_loss/len(train_dataloader):.4f}, "
               f"Info Loss: {epoch_info_loss/len(train_dataloader):.4f}, "
-              f"MSE Loss: {epoch_mse_loss/len(train_dataloader):.4f}, "
               f"Total Loss: {epoch_total_loss/len(train_dataloader):.4f}")
     else:
         print(f"Epoch {epoch+1}/{EPOCHS}, Task Loss: {epoch_task_loss/len(train_dataloader):.4f}, "
